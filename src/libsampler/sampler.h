@@ -72,7 +72,7 @@ class V8_EXPORT_PRIVATE Sampler {
 
  protected:
   // Counts stack samples taken in various VM states.
-  bool is_counting_samples_ = 0;
+  bool is_counting_samples_ = false;
   unsigned js_sample_count_ = 0;
   unsigned external_sample_count_ = 0;
 
@@ -97,7 +97,7 @@ using AtomicMutex = std::atomic_bool;
 
 // A helper that uses an std::atomic_bool to create a lock that is obtained on
 // construction and released on destruction.
-class V8_EXPORT_PRIVATE AtomicGuard {
+class V8_EXPORT_PRIVATE V8_NODISCARD AtomicGuard {
  public:
   // Attempt to obtain the lock represented by |atomic|. |is_blocking|
   // determines whether we will block to obtain the lock, or only make one

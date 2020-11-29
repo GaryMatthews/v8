@@ -3,16 +3,7 @@
 // found in the LICENSE file.
 
 namespace runtime {
-extern transitioning runtime ToStringRT(Context, BigInt): String;
-}
-
-// A namespace to disambiguate calls with the same name as a JS Builtin.
-namespace csa {
-extern macro StringToNumber(String): Number;
-extern macro NonNumberToNumber(implicit context: Context)(JSAnyNotNumber):
-    Number;
-extern macro NonNumberToNumeric(implicit context: Context)(JSAnyNotNumber):
-    Numeric;
+extern transitioning runtime ToString(Context, BigInt): String;
 }
 
 extern enum OrdinaryToPrimitiveHint { kString, kNumber }
@@ -23,33 +14,34 @@ extern macro OrdinaryToPrimitive(implicit context: Context)(
 namespace conversion {
 
 builtin StringToNumber(implicit context: Context)(input: String): Number {
-  return csa::StringToNumber(input);
+  return ::StringToNumber(input);
 }
 
-builtin NonNumberToNumber(implicit context: Context)(input: JSAnyNotNumber):
-    Number {
-  return csa::NonNumberToNumber(input);
+transitioning builtin NonNumberToNumber(implicit context: Context)(
+    input: JSAnyNotNumber): Number {
+  return ::NonNumberToNumber(input);
 }
 
-builtin NonNumberToNumeric(implicit context: Context)(input: JSAnyNotNumber):
+transitioning builtin NonNumberToNumeric(implicit context: Context)(
+    input: JSAnyNotNumber): Numeric {
+  return ::NonNumberToNumeric(input);
+}
+
+transitioning builtin ToNumeric(implicit context: Context)(input: JSAny):
     Numeric {
-  return csa::NonNumberToNumeric(input);
-}
-
-builtin ToNumeric(implicit context: Context)(input: JSAny): Numeric {
   typeswitch (input) {
     case (n: Number): {
       return n;
     }
     case (h: JSAnyNotNumber): {
-      return NonNumberToNumeric(h);
+      return conversion::NonNumberToNumeric(h);
     }
   }
 }
 
 // ES section #sec-tostring-applied-to-the-number-type
 builtin NumberToString(implicit context: Context)(input: Number): String {
-  return number::NumberToString(input);
+  return ::NumberToString(input);
 }
 
 // ES6 section 7.1.2 ToBoolean ( argument )
@@ -58,7 +50,8 @@ builtin ToBoolean(implicit context: Context)(input: JSAny): Boolean {
       return FalseConstant();
 }
 
-builtin ToLength(implicit context: Context)(input: JSAny): Number {
+transitioning builtin ToLength(implicit context: Context)(input: JSAny):
+    Number {
   // We might need to loop once for ToNumber conversion.
   let x: JSAny = input;
   while (true) {
@@ -76,7 +69,7 @@ builtin ToLength(implicit context: Context)(input: JSAny): Number {
         return ChangeFloat64ToTagged(value);
       }
       case (h: JSAnyNotNumber): {
-        x = csa::NonNumberToNumber(h);
+        x = ::NonNumberToNumber(h);
       }
     }
   }
@@ -92,12 +85,12 @@ transitioning builtin ToName(implicit context: Context)(input: JSAny): Name {
         return n;
       }
       case (n: Number): {
-        return number::NumberToString(n);
+        return ::NumberToString(n);
       }
       case (b: BigInt): {
         // We don't have a fast-path for BigInt currently, so just
         // tail call to the %ToString runtime function here for now.
-        tail runtime::ToStringRT(context, b);
+        tail runtime::ToString(context, b);
       }
       case (o: Oddball): {
         return o.to_string;
@@ -119,7 +112,7 @@ transitioning builtin ToObject(implicit context: Context)(input: JSAny):
   try {
     typeswitch (input) {
       case (Smi): {
-        goto WrapPrimitive(NativeContextSlot::NUMBER_FUNCTION_INDEX);
+        goto WrapPrimitive(ContextSlot::NUMBER_FUNCTION_INDEX);
       }
       case (o: JSReceiver): {
         return o;
@@ -127,13 +120,14 @@ transitioning builtin ToObject(implicit context: Context)(input: JSAny):
       case (o: JSAnyNotSmi): {
         const index: intptr = Convert<intptr>(
             o.map.in_object_properties_start_or_constructor_function_index);
-        if (index != kNoConstructorFunctionIndex) goto WrapPrimitive(index);
+        if (index != kNoConstructorFunctionIndex)
+          goto WrapPrimitive(
+              %RawDownCast<Slot<NativeContext, JSFunction>>(index));
         ThrowTypeError(MessageTemplate::kUndefinedOrNullToObject, 'ToObject');
       }
     }
-  } label WrapPrimitive(constructorIndex: intptr) {
-    const nativeContext = LoadNativeContext(context);
-    const constructor = UnsafeCast<JSFunction>(nativeContext[constructorIndex]);
+  } label WrapPrimitive(constructorIndex: Slot<NativeContext, JSFunction>) {
+    const constructor = *NativeContextSlot(constructorIndex);
     const map: Map = UnsafeCast<Map>(constructor.prototype_or_initial_map);
     const wrapper =
         UnsafeCast<JSPrimitiveWrapper>(AllocateFastOrSlowJSObjectFromMap(map));

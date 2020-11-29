@@ -757,7 +757,14 @@ bool ParseScript(Isolate* isolate, Handle<Script> script, ParseInfo* parse_info,
     success = Compiler::CompileForLiveEdit(parse_info, script, isolate)
                   .ToHandle(&shared);
   } else {
-    success = parsing::ParseProgram(parse_info, script, isolate);
+    success = parsing::ParseProgram(parse_info, script, isolate,
+                                    parsing::ReportStatisticsMode::kYes);
+    if (!success) {
+      // Throw the parser error.
+      parse_info->pending_error_handler()->PrepareErrors(
+          isolate, parse_info->ast_value_factory());
+      parse_info->pending_error_handler()->ReportErrors(isolate, script);
+    }
   }
   if (!success) {
     isolate->OptionalRescheduleException(false);
@@ -1003,7 +1010,8 @@ bool CanRestartFrame(
 
 void TranslateSourcePositionTable(Isolate* isolate, Handle<BytecodeArray> code,
                                   const std::vector<SourceChangeRange>& diffs) {
-  SourcePositionTableBuilder builder;
+  Zone zone(isolate->allocator(), ZONE_NAME);
+  SourcePositionTableBuilder builder(&zone);
 
   Handle<ByteArray> source_position_table(code->SourcePositionTable(), isolate);
   for (SourcePositionTableIterator iterator(*source_position_table);
@@ -1017,7 +1025,7 @@ void TranslateSourcePositionTable(Isolate* isolate, Handle<BytecodeArray> code,
 
   Handle<ByteArray> new_source_position_table(
       builder.ToSourcePositionTable(isolate));
-  code->set_source_position_table(*new_source_position_table);
+  code->set_source_position_table(*new_source_position_table, kReleaseStore);
   LOG_CODE_EVENT(isolate,
                  CodeLinePosInfoRecordEvent(code->GetFirstBytecodeAddress(),
                                             *new_source_position_table));
@@ -1145,7 +1153,9 @@ void LiveEdit::PatchScript(Isolate* isolate, Handle<Script> script,
       js_function->set_raw_feedback_cell(
           *isolate->factory()->many_closures_cell());
       if (!js_function->is_compiled()) continue;
-      JSFunction::EnsureFeedbackVector(js_function);
+      IsCompiledScope is_compiled_scope(
+          js_function->shared().is_compiled_scope(isolate));
+      JSFunction::EnsureFeedbackVector(js_function, &is_compiled_scope);
     }
 
     if (!sfi->HasBytecodeArray()) continue;
@@ -1186,7 +1196,9 @@ void LiveEdit::PatchScript(Isolate* isolate, Handle<Script> script,
       js_function->set_raw_feedback_cell(
           *isolate->factory()->many_closures_cell());
       if (!js_function->is_compiled()) continue;
-      JSFunction::EnsureFeedbackVector(js_function);
+      IsCompiledScope is_compiled_scope(
+          js_function->shared().is_compiled_scope(isolate));
+      JSFunction::EnsureFeedbackVector(js_function, &is_compiled_scope);
     }
   }
   SharedFunctionInfo::ScriptIterator it(isolate, *new_script);
@@ -1221,7 +1233,7 @@ void LiveEdit::PatchScript(Isolate* isolate, Handle<Script> script,
     // Check that all the functions in the new script are valid, that their
     // function literals match what is expected, and that start positions are
     // unique.
-    DisallowHeapAllocation no_gc;
+    DisallowGarbageCollection no_gc;
 
     SharedFunctionInfo::ScriptIterator it(isolate, *new_script);
     std::set<int> start_positions;

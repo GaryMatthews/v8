@@ -37,13 +37,18 @@ static NodeVector::iterator FindInsertionPoint(BasicBlock* block) {
   return i;
 }
 
+static const Operator* IntPtrConstant(CommonOperatorBuilder* common,
+                                      intptr_t value) {
+  return kSystemPointerSize == 8
+             ? common->Int64Constant(value)
+             : common->Int32Constant(static_cast<int32_t>(value));
+}
+
 // TODO(dcarney): need to mark code as non-serializable.
 static const Operator* PointerConstant(CommonOperatorBuilder* common,
                                        const void* ptr) {
   intptr_t ptr_as_int = reinterpret_cast<intptr_t>(ptr);
-  return kSystemPointerSize == 8
-             ? common->Int64Constant(ptr_as_int)
-             : common->Int32Constant(static_cast<int32_t>(ptr_as_int));
+  return IntPtrConstant(common, ptr_as_int);
 }
 
 BasicBlockProfilerData* BasicBlockInstrumentor::Instrument(
@@ -59,7 +64,7 @@ BasicBlockProfilerData* BasicBlockInstrumentor::Instrument(
   // Set the function name.
   data->SetFunctionName(info->GetDebugName());
   // Capture the schedule string before instrumentation.
-  {
+  if (FLAG_turbo_profiling_verbose) {
     std::ostringstream os;
     os << *schedule;
     data->SetSchedule(os);
@@ -87,28 +92,30 @@ BasicBlockProfilerData* BasicBlockInstrumentor::Instrument(
   } else {
     counters_array = graph->NewNode(PointerConstant(&common, data->counts()));
   }
-  Node* one = graph->NewNode(common.Int32Constant(1));
+  Node* one = graph->NewNode(common.Float64Constant(1));
   BasicBlockVector* blocks = schedule->rpo_order();
   size_t block_number = 0;
   for (BasicBlockVector::iterator it = blocks->begin(); block_number < n_blocks;
        ++it, ++block_number) {
     BasicBlock* block = (*it);
-    data->SetBlockRpoNumber(block_number, block->rpo_number());
+    // Iteration is already in reverse post-order.
+    DCHECK_EQ(block->rpo_number(), block_number);
+    data->SetBlockId(block_number, block->id().ToInt());
     // It is unnecessary to wire effect and control deps for load and store
     // since this happens after scheduling.
     // Construct increment operation.
-    int offset_to_counter_value = static_cast<int>(block_number) * kInt32Size;
+    int offset_to_counter_value = static_cast<int>(block_number) * kDoubleSize;
     if (on_heap_counters) {
       offset_to_counter_value += ByteArray::kHeaderSize - kHeapObjectTag;
     }
     Node* offset_to_counter =
-        graph->NewNode(common.Int32Constant(offset_to_counter_value));
+        graph->NewNode(IntPtrConstant(&common, offset_to_counter_value));
     Node* load =
-        graph->NewNode(machine.Load(MachineType::Uint32()), counters_array,
+        graph->NewNode(machine.Load(MachineType::Float64()), counters_array,
                        offset_to_counter, graph->start(), graph->start());
-    Node* inc = graph->NewNode(machine.Int32Add(), load, one);
+    Node* inc = graph->NewNode(machine.Float64Add(), load, one);
     Node* store = graph->NewNode(
-        machine.Store(StoreRepresentation(MachineRepresentation::kWord32,
+        machine.Store(StoreRepresentation(MachineRepresentation::kFloat64,
                                           kNoWriteBarrier)),
         counters_array, offset_to_counter, inc, graph->start(), graph->start());
     // Insert the new nodes.

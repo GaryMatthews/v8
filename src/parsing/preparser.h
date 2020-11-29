@@ -575,6 +575,10 @@ class PreParserFactory {
   }
 
   PreParserExpression NewOptionalChain(const PreParserExpression& expr) {
+    // Needed to track `delete a?.#b` early errors
+    if (expr.IsPrivateReference()) {
+      return PreParserExpression::PrivateReference();
+    }
     return PreParserExpression::Default();
   }
 
@@ -645,6 +649,7 @@ class PreParserFactory {
                               bool optional_chain = false) {
     if (possibly_eval == Call::IS_POSSIBLY_EVAL) {
       DCHECK(expression.IsIdentifier() && expression.AsIdentifier().IsEval());
+      DCHECK(!optional_chain);
       return PreParserExpression::CallEval();
     }
     return PreParserExpression::Call();
@@ -818,6 +823,9 @@ class PreParserFormalParameters : public FormalParametersBase {
 class PreParserFuncNameInferrer {
  public:
   explicit PreParserFuncNameInferrer(AstValueFactory* avf) {}
+  PreParserFuncNameInferrer(const PreParserFuncNameInferrer&) = delete;
+  PreParserFuncNameInferrer& operator=(const PreParserFuncNameInferrer&) =
+      delete;
   void RemoveAsyncKeywordFromEnd() const {}
   void Infer() const {}
   void RemoveLastFunction() const {}
@@ -825,13 +833,9 @@ class PreParserFuncNameInferrer {
   class State {
    public:
     explicit State(PreParserFuncNameInferrer* fni) {}
-
-   private:
-    DISALLOW_COPY_AND_ASSIGN(State);
+    State(const State&) = delete;
+    State& operator=(const State&) = delete;
   };
-
- private:
-  DISALLOW_COPY_AND_ASSIGN(PreParserFuncNameInferrer);
 };
 
 class PreParserSourceRange {
@@ -1524,6 +1528,11 @@ class PreParser : public ParserBase<PreParser> {
   }
 
   V8_INLINE PreParserExpression ThisExpression() {
+    UseThis();
+    return PreParserExpression::This();
+  }
+
+  V8_INLINE PreParserExpression NewThisExpression(int pos) {
     UseThis();
     return PreParserExpression::This();
   }

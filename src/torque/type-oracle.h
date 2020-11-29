@@ -166,6 +166,10 @@ class TypeOracle : public ContextualClass<TypeOracle> {
     return Get().GetBuiltinType(CONSTEXPR_BOOL_TYPE_STRING);
   }
 
+  static const Type* GetConstexprStringType() {
+    return Get().GetBuiltinType(CONSTEXPR_STRING_TYPE_STRING);
+  }
+
   static const Type* GetConstexprIntPtrType() {
     return Get().GetBuiltinType(CONSTEXPR_INTPTR_TYPE_STRING);
   }
@@ -196,6 +200,10 @@ class TypeOracle : public ContextualClass<TypeOracle> {
 
   static const Type* GetHeapObjectType() {
     return Get().GetBuiltinType(HEAP_OBJECT_TYPE_STRING);
+  }
+
+  static const Type* GetTaggedZeroPatternType() {
+    return Get().GetBuiltinType(TAGGED_ZERO_PATTERN_TYPE_STRING);
   }
 
   static const Type* GetJSAnyType() {
@@ -302,6 +310,10 @@ class TypeOracle : public ContextualClass<TypeOracle> {
 
   static const Type* GetContextType() {
     return Get().GetBuiltinType(CONTEXT_TYPE_STRING);
+  }
+
+  static const Type* GetNoContextType() {
+    return Get().GetBuiltinType(NO_CONTEXT_TYPE_STRING);
   }
 
   static const Type* GetNativeContextType() {

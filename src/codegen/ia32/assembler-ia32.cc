@@ -81,9 +81,10 @@ Immediate Immediate::EmbeddedStringConstant(const StringConstantBase* str) {
 
 namespace {
 
-#if !V8_LIBC_MSVCRT
-
-V8_INLINE uint64_t _xgetbv(unsigned int xcr) {
+V8_INLINE uint64_t xgetbv(unsigned int xcr) {
+#if V8_LIBC_MSVCRT
+  return _xgetbv(xcr);
+#else
   unsigned eax, edx;
   // Check xgetbv; this uses a .byte sequence instead of the instruction
   // directly because older assemblers do not include support for xgetbv and
@@ -91,11 +92,8 @@ V8_INLINE uint64_t _xgetbv(unsigned int xcr) {
   // used.
   __asm__ volatile(".byte 0x0F, 0x01, 0xD0" : "=a"(eax), "=d"(edx) : "c"(xcr));
   return static_cast<uint64_t>(eax) | (static_cast<uint64_t>(edx) << 32);
+#endif
 }
-
-#define _XCR_XFEATURE_ENABLED_MASK 0
-
-#endif  // !V8_LIBC_MSVCRT
 
 bool OSHasAVXSupport() {
 #if V8_OS_MACOSX
@@ -116,7 +114,7 @@ bool OSHasAVXSupport() {
   if (kernel_version_major <= 13) return false;
 #endif  // V8_OS_MACOSX
   // Check whether OS claims to support AVX.
-  uint64_t feature_mask = _xgetbv(_XCR_XFEATURE_ENABLED_MASK);
+  uint64_t feature_mask = xgetbv(0);  // XCR_XFEATURE_ENABLED_MASK
   return (feature_mask & 0x6) == 0x6;
 }
 
@@ -302,6 +300,15 @@ Assembler::Assembler(const AssemblerOptions& options,
 void Assembler::GetCode(Isolate* isolate, CodeDesc* desc,
                         SafepointTableBuilder* safepoint_table_builder,
                         int handler_table_offset) {
+  // As a crutch to avoid having to add manual Align calls wherever we use a
+  // raw workflow to create Code objects (mostly in tests), add another Align
+  // call here. It does no harm - the end of the Code object is aligned to the
+  // (larger) kCodeAlignment anyways.
+  // TODO(jgruber): Consider moving responsibility for proper alignment to
+  // metadata table builders (safepoint, handler, constant pool, code
+  // comments).
+  DataAlign(Code::kMetadataAlignment);
+
   const int code_comments_size = WriteCodeComments();
 
   // Finalize code (at this point overflow() may be true, but the gap ensures
@@ -510,13 +517,6 @@ void Assembler::pop(Operand dst) {
   emit_operand(eax, dst);
 }
 
-void Assembler::enter(const Immediate& size) {
-  EnsureSpace ensure_space(this);
-  EMIT(0xC8);
-  emit_w(size);
-  EMIT(0);
-}
-
 void Assembler::leave() {
   EnsureSpace ensure_space(this);
   EMIT(0xC9);
@@ -689,6 +689,29 @@ void Assembler::rep_stos() {
 void Assembler::stos() {
   EnsureSpace ensure_space(this);
   EMIT(0xAB);
+}
+
+void Assembler::xadd(Operand dst, Register src) {
+  EnsureSpace ensure_space(this);
+  EMIT(0x0F);
+  EMIT(0xC1);
+  emit_operand(src, dst);
+}
+
+void Assembler::xadd_b(Operand dst, Register src) {
+  DCHECK(src.is_byte_register());
+  EnsureSpace ensure_space(this);
+  EMIT(0x0F);
+  EMIT(0xC0);
+  emit_operand(src, dst);
+}
+
+void Assembler::xadd_w(Operand dst, Register src) {
+  EnsureSpace ensure_space(this);
+  EMIT(0x66);
+  EMIT(0x0F);
+  EMIT(0xC1);
+  emit_operand(src, dst);
 }
 
 void Assembler::xchg(Register dst, Register src) {
@@ -2246,6 +2269,30 @@ void Assembler::ucomisd(XMMRegister dst, Operand src) {
   emit_sse_operand(dst, src);
 }
 
+void Assembler::roundps(XMMRegister dst, XMMRegister src, RoundingMode mode) {
+  DCHECK(IsEnabled(SSE4_1));
+  EnsureSpace ensure_space(this);
+  EMIT(0x66);
+  EMIT(0x0F);
+  EMIT(0x3A);
+  EMIT(0x08);
+  emit_sse_operand(dst, src);
+  // Mask precision exeption.
+  EMIT(static_cast<byte>(mode) | 0x8);
+}
+
+void Assembler::roundpd(XMMRegister dst, XMMRegister src, RoundingMode mode) {
+  DCHECK(IsEnabled(SSE4_1));
+  EnsureSpace ensure_space(this);
+  EMIT(0x66);
+  EMIT(0x0F);
+  EMIT(0x3A);
+  EMIT(0x09);
+  emit_sse_operand(dst, src);
+  // Mask precision exeption.
+  EMIT(static_cast<byte>(mode) | 0x8);
+}
+
 void Assembler::roundss(XMMRegister dst, XMMRegister src, RoundingMode mode) {
   DCHECK(IsEnabled(SSE4_1));
   EnsureSpace ensure_space(this);
@@ -2365,6 +2412,20 @@ void Assembler::shufpd(XMMRegister dst, XMMRegister src, byte imm8) {
   EMIT(0xC6);
   emit_sse_operand(dst, src);
   EMIT(imm8);
+}
+
+void Assembler::movlps(XMMRegister dst, Operand src) {
+  EnsureSpace ensure_space(this);
+  EMIT(0x0F);
+  EMIT(0x12);
+  emit_sse_operand(dst, src);
+}
+
+void Assembler::movhps(XMMRegister dst, Operand src) {
+  EnsureSpace ensure_space(this);
+  EMIT(0x0F);
+  EMIT(0x16);
+  emit_sse_operand(dst, src);
 }
 
 void Assembler::movdqa(Operand dst, XMMRegister src) {
@@ -2788,6 +2849,14 @@ void Assembler::vshufpd(XMMRegister dst, XMMRegister src1, Operand src2,
   EMIT(imm8);
 }
 
+void Assembler::vmovlps(XMMRegister dst, XMMRegister src1, Operand src2) {
+  vinstr(0x12, dst, src1, src2, kNone, k0F, kWIG);
+}
+
+void Assembler::vmovhps(XMMRegister dst, XMMRegister src1, Operand src2) {
+  vinstr(0x16, dst, src1, src2, kNone, k0F, kWIG);
+}
+
 void Assembler::vcmpps(XMMRegister dst, XMMRegister src1, Operand src2,
                        uint8_t cmp) {
   vps(0xC2, dst, src1, src2);
@@ -2921,6 +2990,15 @@ void Assembler::vpinsrd(XMMRegister dst, XMMRegister src1, Operand src2,
   EMIT(offset);
 }
 
+void Assembler::vroundps(XMMRegister dst, XMMRegister src, RoundingMode mode) {
+  vinstr(0x08, dst, xmm0, Operand(src), k66, k0F3A, kWIG);
+  EMIT(static_cast<byte>(mode) | 0x8);  // Mask precision exception.
+}
+void Assembler::vroundpd(XMMRegister dst, XMMRegister src, RoundingMode mode) {
+  vinstr(0x09, dst, xmm0, Operand(src), k66, k0F3A, kWIG);
+  EMIT(static_cast<byte>(mode) | 0x8);  // Mask precision exception.
+}
+
 void Assembler::vmovmskps(Register dst, XMMRegister src) {
   DCHECK(IsEnabled(AVX));
   EnsureSpace ensure_space(this);
@@ -3021,6 +3099,16 @@ void Assembler::sse4_instr(XMMRegister dst, Operand src, byte prefix,
   EMIT(escape2);
   EMIT(opcode);
   emit_sse_operand(dst, src);
+}
+
+void Assembler::vinstr(byte op, XMMRegister dst, XMMRegister src1,
+                       XMMRegister src2, SIMDPrefix pp, LeadingOpcode m,
+                       VexW w) {
+  DCHECK(IsEnabled(AVX));
+  EnsureSpace ensure_space(this);
+  emit_vex_prefix(src1, kL128, pp, m, w);
+  EMIT(op);
+  emit_sse_operand(dst, src2);
 }
 
 void Assembler::vinstr(byte op, XMMRegister dst, XMMRegister src1, Operand src2,

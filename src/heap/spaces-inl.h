@@ -10,6 +10,7 @@
 #include "src/common/globals.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/incremental-marking.h"
+#include "src/heap/large-spaces.h"
 #include "src/heap/memory-chunk-inl.h"
 #include "src/heap/new-spaces.h"
 #include "src/heap/paged-spaces.h"
@@ -132,53 +133,6 @@ MemoryChunk* OldGenerationMemoryChunkIterator::next() {
       break;
   }
   UNREACHABLE();
-}
-
-bool FreeListCategory::is_linked(FreeList* owner) const {
-  return prev_ != nullptr || next_ != nullptr ||
-         owner->categories_[type_] == this;
-}
-
-void FreeListCategory::UpdateCountersAfterAllocation(size_t allocation_size) {
-  available_ -= allocation_size;
-}
-
-Page* FreeList::GetPageForCategoryType(FreeListCategoryType type) {
-  FreeListCategory* category_top = top(type);
-  if (category_top != nullptr) {
-    DCHECK(!category_top->top().is_null());
-    return Page::FromHeapObject(category_top->top());
-  } else {
-    return nullptr;
-  }
-}
-
-Page* FreeListLegacy::GetPageForSize(size_t size_in_bytes) {
-  const int minimum_category =
-      static_cast<int>(SelectFreeListCategoryType(size_in_bytes));
-  Page* page = GetPageForCategoryType(kHuge);
-  if (!page && static_cast<int>(kLarge) >= minimum_category)
-    page = GetPageForCategoryType(kLarge);
-  if (!page && static_cast<int>(kMedium) >= minimum_category)
-    page = GetPageForCategoryType(kMedium);
-  if (!page && static_cast<int>(kSmall) >= minimum_category)
-    page = GetPageForCategoryType(kSmall);
-  if (!page && static_cast<int>(kTiny) >= minimum_category)
-    page = GetPageForCategoryType(kTiny);
-  if (!page && static_cast<int>(kTiniest) >= minimum_category)
-    page = GetPageForCategoryType(kTiniest);
-  return page;
-}
-
-Page* FreeListFastAlloc::GetPageForSize(size_t size_in_bytes) {
-  const int minimum_category =
-      static_cast<int>(SelectFreeListCategoryType(size_in_bytes));
-  Page* page = GetPageForCategoryType(kHuge);
-  if (!page && static_cast<int>(kLarge) >= minimum_category)
-    page = GetPageForCategoryType(kLarge);
-  if (!page && static_cast<int>(kMedium) >= minimum_category)
-    page = GetPageForCategoryType(kMedium);
-  return page;
 }
 
 AllocationResult LocalAllocationBuffer::AllocateRawAligned(

@@ -7,12 +7,15 @@
 #include <cinttypes>
 
 #include "src/base/address-region.h"
+#include "src/common/globals.h"
 #include "src/execution/isolate.h"
 #include "src/flags/flags.h"
 #include "src/heap/gc-tracer.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/memory-chunk.h"
+#include "src/heap/read-only-spaces.h"
 #include "src/logging/log.h"
+#include "src/utils/allocation.h"
 
 namespace v8 {
 namespace internal {
@@ -86,7 +89,7 @@ void MemoryAllocator::InitializeCodePageAllocator(
                 page_allocator->AllocatePageSize());
   VirtualMemory reservation(
       page_allocator, requested, reinterpret_cast<void*>(hint),
-      Max(kMinExpectedOSPageSize, page_allocator->AllocatePageSize()));
+      std::max(kMinExpectedOSPageSize, page_allocator->AllocatePageSize()));
   if (!reservation.IsReserved()) {
     V8::FatalProcessOutOfMemory(isolate_,
                                 "CodeRange setup: allocate virtual memory");
@@ -151,68 +154,55 @@ void MemoryAllocator::TearDown() {
   data_page_allocator_ = nullptr;
 }
 
-class MemoryAllocator::Unmapper::UnmapFreeMemoryTask : public CancelableTask {
+class MemoryAllocator::Unmapper::UnmapFreeMemoryJob : public JobTask {
  public:
-  explicit UnmapFreeMemoryTask(Isolate* isolate, Unmapper* unmapper)
-      : CancelableTask(isolate),
-        unmapper_(unmapper),
-        tracer_(isolate->heap()->tracer()) {}
+  explicit UnmapFreeMemoryJob(Isolate* isolate, Unmapper* unmapper)
+      : unmapper_(unmapper), tracer_(isolate->heap()->tracer()) {}
 
- private:
-  void RunInternal() override {
-    TRACE_BACKGROUND_GC(tracer_,
-                        GCTracer::BackgroundScope::BACKGROUND_UNMAPPER);
-    unmapper_->PerformFreeMemoryOnQueuedChunks<FreeMode::kUncommitPooled>();
-    unmapper_->active_unmapping_tasks_--;
-    unmapper_->pending_unmapping_tasks_semaphore_.Signal();
+  void Run(JobDelegate* delegate) override {
+    TRACE_GC1(tracer_, GCTracer::Scope::BACKGROUND_UNMAPPER,
+              ThreadKind::kBackground);
+    unmapper_->PerformFreeMemoryOnQueuedChunks<FreeMode::kUncommitPooled>(
+        delegate);
     if (FLAG_trace_unmapper) {
-      PrintIsolate(unmapper_->heap_->isolate(),
-                   "UnmapFreeMemoryTask Done: id=%" PRIu64 "\n", id());
+      PrintIsolate(unmapper_->heap_->isolate(), "UnmapFreeMemoryTask Done\n");
     }
   }
 
+  size_t GetMaxConcurrency(size_t worker_count) const override {
+    const size_t kTaskPerChunk = 8;
+    return std::min<size_t>(
+        kMaxUnmapperTasks,
+        worker_count +
+            (unmapper_->NumberOfCommittedChunks() + kTaskPerChunk - 1) /
+                kTaskPerChunk);
+  }
+
+ private:
   Unmapper* const unmapper_;
   GCTracer* const tracer_;
-  DISALLOW_COPY_AND_ASSIGN(UnmapFreeMemoryTask);
+  DISALLOW_COPY_AND_ASSIGN(UnmapFreeMemoryJob);
 };
 
 void MemoryAllocator::Unmapper::FreeQueuedChunks() {
   if (!heap_->IsTearingDown() && FLAG_concurrent_sweeping) {
-    if (!MakeRoomForNewTasks()) {
-      // kMaxUnmapperTasks are already running. Avoid creating any more.
+    if (job_handle_ && job_handle_->IsValid()) {
+      job_handle_->NotifyConcurrencyIncrease();
+    } else {
+      job_handle_ = V8::GetCurrentPlatform()->PostJob(
+          TaskPriority::kUserVisible,
+          std::make_unique<UnmapFreeMemoryJob>(heap_->isolate(), this));
       if (FLAG_trace_unmapper) {
-        PrintIsolate(heap_->isolate(),
-                     "Unmapper::FreeQueuedChunks: reached task limit (%d)\n",
-                     kMaxUnmapperTasks);
+        PrintIsolate(heap_->isolate(), "Unmapper::FreeQueuedChunks: new Job\n");
       }
-      return;
     }
-    auto task = std::make_unique<UnmapFreeMemoryTask>(heap_->isolate(), this);
-    if (FLAG_trace_unmapper) {
-      PrintIsolate(heap_->isolate(),
-                   "Unmapper::FreeQueuedChunks: new task id=%" PRIu64 "\n",
-                   task->id());
-    }
-    DCHECK_LT(pending_unmapping_tasks_, kMaxUnmapperTasks);
-    DCHECK_LE(active_unmapping_tasks_, pending_unmapping_tasks_);
-    DCHECK_GE(active_unmapping_tasks_, 0);
-    active_unmapping_tasks_++;
-    task_ids_[pending_unmapping_tasks_++] = task->id();
-    V8::GetCurrentPlatform()->CallOnWorkerThread(std::move(task));
   } else {
     PerformFreeMemoryOnQueuedChunks<FreeMode::kUncommitPooled>();
   }
 }
 
 void MemoryAllocator::Unmapper::CancelAndWaitForPendingTasks() {
-  for (int i = 0; i < pending_unmapping_tasks_; i++) {
-    if (heap_->isolate()->cancelable_task_manager()->TryAbort(task_ids_[i]) !=
-        TryAbortResult::kTaskAborted) {
-      pending_unmapping_tasks_semaphore_.Wait();
-    }
-  }
-  pending_unmapping_tasks_ = 0;
-  active_unmapping_tasks_ = 0;
+  if (job_handle_ && job_handle_->IsValid()) job_handle_->Join();
 
   if (FLAG_trace_unmapper) {
     PrintIsolate(
@@ -231,26 +221,18 @@ void MemoryAllocator::Unmapper::EnsureUnmappingCompleted() {
   PerformFreeMemoryOnQueuedChunks<FreeMode::kReleasePooled>();
 }
 
-bool MemoryAllocator::Unmapper::MakeRoomForNewTasks() {
-  DCHECK_LE(pending_unmapping_tasks_, kMaxUnmapperTasks);
-
-  if (active_unmapping_tasks_ == 0 && pending_unmapping_tasks_ > 0) {
-    // All previous unmapping tasks have been run to completion.
-    // Finalize those tasks to make room for new ones.
-    CancelAndWaitForPendingTasks();
-  }
-  return pending_unmapping_tasks_ != kMaxUnmapperTasks;
-}
-
-void MemoryAllocator::Unmapper::PerformFreeMemoryOnQueuedNonRegularChunks() {
+void MemoryAllocator::Unmapper::PerformFreeMemoryOnQueuedNonRegularChunks(
+    JobDelegate* delegate) {
   MemoryChunk* chunk = nullptr;
   while ((chunk = GetMemoryChunkSafe<kNonRegular>()) != nullptr) {
     allocator_->PerformFreeMemory(chunk);
+    if (delegate && delegate->ShouldYield()) return;
   }
 }
 
 template <MemoryAllocator::Unmapper::FreeMode mode>
-void MemoryAllocator::Unmapper::PerformFreeMemoryOnQueuedChunks() {
+void MemoryAllocator::Unmapper::PerformFreeMemoryOnQueuedChunks(
+    JobDelegate* delegate) {
   MemoryChunk* chunk = nullptr;
   if (FLAG_trace_unmapper) {
     PrintIsolate(
@@ -263,6 +245,7 @@ void MemoryAllocator::Unmapper::PerformFreeMemoryOnQueuedChunks() {
     bool pooled = chunk->IsFlagSet(MemoryChunk::POOLED);
     allocator_->PerformFreeMemory(chunk);
     if (pooled) AddMemoryChunkSafe<kPooled>(chunk);
+    if (delegate && delegate->ShouldYield()) return;
   }
   if (mode == MemoryAllocator::Unmapper::FreeMode::kReleasePooled) {
     // The previous loop uncommitted any pages marked as pooled and added them
@@ -270,13 +253,14 @@ void MemoryAllocator::Unmapper::PerformFreeMemoryOnQueuedChunks() {
     // though.
     while ((chunk = GetMemoryChunkSafe<kPooled>()) != nullptr) {
       allocator_->Free<MemoryAllocator::kAlreadyPooled>(chunk);
+      if (delegate && delegate->ShouldYield()) return;
     }
   }
   PerformFreeMemoryOnQueuedNonRegularChunks();
 }
 
 void MemoryAllocator::Unmapper::TearDown() {
-  CHECK_EQ(0, pending_unmapping_tasks_);
+  CHECK(!job_handle_ || !job_handle_->IsValid());
   PerformFreeMemoryOnQueuedChunks<FreeMode::kReleasePooled>();
   for (int i = 0; i < kNumberOfChunkQueues; i++) {
     DCHECK(chunks_[i].empty());
@@ -372,10 +356,9 @@ Address MemoryAllocator::AllocateAlignedMemory(
   return base;
 }
 
-MemoryChunk* MemoryAllocator::AllocateChunk(size_t reserve_area_size,
-                                            size_t commit_area_size,
-                                            Executability executable,
-                                            Space* owner) {
+V8_EXPORT_PRIVATE BasicMemoryChunk* MemoryAllocator::AllocateBasicChunk(
+    size_t reserve_area_size, size_t commit_area_size, Executability executable,
+    BaseSpace* owner) {
   DCHECK_LE(commit_area_size, reserve_area_size);
 
   size_t chunk_size;
@@ -483,19 +466,35 @@ MemoryChunk* MemoryAllocator::AllocateChunk(size_t reserve_area_size,
       size_executable_ -= chunk_size;
     }
     CHECK(last_chunk_.IsReserved());
-    return AllocateChunk(reserve_area_size, commit_area_size, executable,
-                         owner);
+    return AllocateBasicChunk(reserve_area_size, commit_area_size, executable,
+                              owner);
   }
 
+  BasicMemoryChunk* chunk =
+      BasicMemoryChunk::Initialize(heap, base, chunk_size, area_start, area_end,
+                                   owner, std::move(reservation));
+
+  return chunk;
+}
+
+MemoryChunk* MemoryAllocator::AllocateChunk(size_t reserve_area_size,
+                                            size_t commit_area_size,
+                                            Executability executable,
+                                            BaseSpace* owner) {
+  BasicMemoryChunk* basic_chunk = AllocateBasicChunk(
+      reserve_area_size, commit_area_size, executable, owner);
+
+  if (basic_chunk == nullptr) return nullptr;
+
   MemoryChunk* chunk =
-      MemoryChunk::Initialize(heap, base, chunk_size, area_start, area_end,
-                              executable, owner, std::move(reservation));
+      MemoryChunk::Initialize(basic_chunk, isolate_->heap(), executable);
 
   if (chunk->executable()) RegisterExecutableMemoryChunk(chunk);
   return chunk;
 }
 
-void MemoryAllocator::PartialFreeMemory(MemoryChunk* chunk, Address start_free,
+void MemoryAllocator::PartialFreeMemory(BasicMemoryChunk* chunk,
+                                        Address start_free,
                                         size_t bytes_to_free,
                                         Address new_area_end) {
   VirtualMemory* reservation = chunk->reserved_memory();
@@ -519,20 +518,52 @@ void MemoryAllocator::PartialFreeMemory(MemoryChunk* chunk, Address start_free,
   size_ -= released_bytes;
 }
 
-void MemoryAllocator::UnregisterMemory(MemoryChunk* chunk) {
-  DCHECK(!chunk->IsFlagSet(MemoryChunk::UNREGISTERED));
+void MemoryAllocator::UnregisterSharedMemory(BasicMemoryChunk* chunk) {
   VirtualMemory* reservation = chunk->reserved_memory();
   const size_t size =
       reservation->IsReserved() ? reservation->size() : chunk->size();
   DCHECK_GE(size_, static_cast<size_t>(size));
   size_ -= size;
-  if (chunk->executable() == EXECUTABLE) {
+}
+
+void MemoryAllocator::UnregisterMemory(BasicMemoryChunk* chunk,
+                                       Executability executable) {
+  DCHECK(!chunk->IsFlagSet(MemoryChunk::UNREGISTERED));
+  VirtualMemory* reservation = chunk->reserved_memory();
+  const size_t size =
+      reservation->IsReserved() ? reservation->size() : chunk->size();
+  DCHECK_GE(size_, static_cast<size_t>(size));
+
+  size_ -= size;
+  if (executable == EXECUTABLE) {
     DCHECK_GE(size_executable_, size);
     size_executable_ -= size;
+    UnregisterExecutableMemoryChunk(static_cast<MemoryChunk*>(chunk));
   }
-
-  if (chunk->executable()) UnregisterExecutableMemoryChunk(chunk);
   chunk->SetFlag(MemoryChunk::UNREGISTERED);
+}
+
+void MemoryAllocator::UnregisterMemory(MemoryChunk* chunk) {
+  UnregisterMemory(chunk, chunk->executable());
+}
+
+void MemoryAllocator::FreeReadOnlyPage(ReadOnlyPage* chunk) {
+  DCHECK(!chunk->IsFlagSet(MemoryChunk::PRE_FREED));
+  LOG(isolate_, DeleteEvent("MemoryChunk", chunk));
+
+  UnregisterSharedMemory(chunk);
+
+  v8::PageAllocator* allocator = page_allocator(NOT_EXECUTABLE);
+  VirtualMemory* reservation = chunk->reserved_memory();
+  if (reservation->IsReserved()) {
+    reservation->FreeReadOnly();
+  } else {
+    // Only read-only pages can have a non-initialized reservation object. This
+    // happens when the pages are remapped to multiple locations and where the
+    // reservation would therefore be invalid.
+    FreeMemory(allocator, chunk->address(),
+               RoundUp(chunk->size(), allocator->AllocatePageSize()));
+  }
 }
 
 void MemoryAllocator::PreFreeMemory(MemoryChunk* chunk) {
@@ -547,20 +578,15 @@ void MemoryAllocator::PreFreeMemory(MemoryChunk* chunk) {
 void MemoryAllocator::PerformFreeMemory(MemoryChunk* chunk) {
   DCHECK(chunk->IsFlagSet(MemoryChunk::UNREGISTERED));
   DCHECK(chunk->IsFlagSet(MemoryChunk::PRE_FREED));
+  DCHECK(!chunk->InReadOnlySpace());
   chunk->ReleaseAllAllocatedMemory();
 
   VirtualMemory* reservation = chunk->reserved_memory();
   if (chunk->IsFlagSet(MemoryChunk::POOLED)) {
     UncommitMemory(reservation);
   } else {
-    if (reservation->IsReserved()) {
-      reservation->Free();
-    } else {
-      // Only read-only pages can have non-initialized reservation object.
-      DCHECK_EQ(RO_SPACE, chunk->owner_identity());
-      FreeMemory(page_allocator(chunk->executable()), chunk->address(),
-                 chunk->size());
-    }
+    DCHECK(reservation->IsReserved());
+    reservation->Free();
   }
 }
 
@@ -630,6 +656,22 @@ template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)
     Page* MemoryAllocator::AllocatePage<MemoryAllocator::kPooled, SemiSpace>(
         size_t size, SemiSpace* owner, Executability executable);
 
+ReadOnlyPage* MemoryAllocator::AllocateReadOnlyPage(size_t size,
+                                                    ReadOnlySpace* owner) {
+  BasicMemoryChunk* chunk = nullptr;
+  if (chunk == nullptr) {
+    chunk = AllocateBasicChunk(size, size, NOT_EXECUTABLE, owner);
+  }
+  if (chunk == nullptr) return nullptr;
+  return owner->InitializePage(chunk);
+}
+
+std::unique_ptr<::v8::PageAllocator::SharedMemoryMapping>
+MemoryAllocator::RemapSharedPage(
+    ::v8::PageAllocator::SharedMemory* shared_memory, Address new_address) {
+  return shared_memory->RemapTo(reinterpret_cast<void*>(new_address));
+}
+
 LargePage* MemoryAllocator::AllocateLargePage(size_t size,
                                               LargeObjectSpace* owner,
                                               Executability executable) {
@@ -655,8 +697,10 @@ MemoryChunk* MemoryAllocator::AllocatePagePooled(SpaceType* owner) {
   if (Heap::ShouldZapGarbage()) {
     ZapBlock(start, size, kZapValue);
   }
-  MemoryChunk::Initialize(isolate_->heap(), start, size, area_start, area_end,
-                          NOT_EXECUTABLE, owner, std::move(reservation));
+  BasicMemoryChunk* basic_chunk =
+      BasicMemoryChunk::Initialize(isolate_->heap(), start, size, area_start,
+                                   area_end, owner, std::move(reservation));
+  MemoryChunk::Initialize(basic_chunk, isolate_->heap(), NOT_EXECUTABLE);
   size_ += size;
   return chunk;
 }

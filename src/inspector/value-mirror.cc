@@ -54,10 +54,19 @@ ResultType unpackWasmValue(v8::Local<v8::Context> context,
   return result;
 }
 
+String16 descriptionForWasmS128(std::array<uint8_t, 16> arr) {
+  String16Builder builder;
+  for (int i = 0; i < 16; i++) {
+    builder.appendUnsignedAsHex(arr.at(i));
+    builder.append(" ");
+  }
+  return builder.toString();
+}
+
 // Partial list of Wasm's ValueType, copied here to avoid including internal
 // header. Using an unscoped enumeration here to allow implicit conversions from
 // int. Keep in sync with ValueType::Kind in wasm/value-type.h.
-enum WasmValueType { kStmt, kI32, kI64, kF32, kF64, kS128, kAnyRef };
+enum WasmValueType { kStmt, kI32, kI64, kF32, kF64, kS128, kExternRef };
 
 Response toProtocolValue(v8::Local<v8::Context> context,
                          v8::Local<v8::Value> value, int maxDepth,
@@ -114,7 +123,7 @@ Response toProtocolValue(v8::Local<v8::Context> context,
   if (value->IsObject()) {
     std::unique_ptr<protocol::DictionaryValue> jsonObject =
         protocol::DictionaryValue::create();
-    v8::Local<v8::Object> object = v8::Local<v8::Object>::Cast(value);
+    v8::Local<v8::Object> object = value.As<v8::Object>();
     v8::Local<v8::Array> propertyNames;
     if (!object->GetPropertyNames(context).ToLocal(&propertyNames))
       return Response::InternalError();
@@ -125,8 +134,8 @@ Response toProtocolValue(v8::Local<v8::Context> context,
         return Response::InternalError();
       // FIXME(yurys): v8::Object should support GetOwnPropertyNames
       if (name->IsString()) {
-        v8::Maybe<bool> hasRealNamedProperty = object->HasRealNamedProperty(
-            context, v8::Local<v8::String>::Cast(name));
+        v8::Maybe<bool> hasRealNamedProperty =
+            object->HasRealNamedProperty(context, name.As<v8::String>());
         if (hasRealNamedProperty.IsNothing() ||
             !hasRealNamedProperty.FromJust())
           continue;
@@ -176,12 +185,20 @@ Response toProtocolValue(v8::Local<v8::Context> context,
             unpackWasmValue<double>(context, wasmValue->bytes()));
         break;
       }
-      case kAnyRef: {
-        std::unique_ptr<protocol::Value> anyrefValue;
-        Response response =
-            toProtocolValue(context, wasmValue->ref(), maxDepth, &anyrefValue);
+      case kS128: {
+        auto bytes = wasmValue->bytes();
+        DCHECK_EQ(16, bytes->Length());
+        auto s128 = unpackWasmValue<std::array<uint8_t, 16>>(context, bytes);
+        String16 desc = descriptionForWasmS128(s128);
+        *result = protocol::StringValue::create(desc);
+        break;
+      }
+      case kExternRef: {
+        std::unique_ptr<protocol::Value> externrefValue;
+        Response response = toProtocolValue(context, wasmValue->ref(), maxDepth,
+                                            &externrefValue);
         if (!response.IsSuccess()) return response;
-        *result = std::move(anyrefValue);
+        *result = std::move(externrefValue);
         break;
       }
       default: {
@@ -255,6 +272,7 @@ String16 descriptionForRegExp(v8::Isolate* isolate,
   v8::RegExp::Flags flags = value->GetFlags();
   if (flags & v8::RegExp::Flags::kGlobal) description.append('g');
   if (flags & v8::RegExp::Flags::kIgnoreCase) description.append('i');
+  if (flags & v8::RegExp::Flags::kLinear) description.append('l');
   if (flags & v8::RegExp::Flags::kMultiline) description.append('m');
   if (flags & v8::RegExp::Flags::kDotAll) description.append('s');
   if (flags & v8::RegExp::Flags::kUnicode) description.append('u');
@@ -525,8 +543,10 @@ class WasmValueMirror final : public ValueMirror {
         return RemoteObject::SubtypeEnum::F32;
       case kF64:
         return RemoteObject::SubtypeEnum::F64;
-      case kAnyRef:
-        return RemoteObject::SubtypeEnum::Anyref;
+      case kS128:
+        return RemoteObject::SubtypeEnum::V128;
+      case kExternRef:
+        return RemoteObject::SubtypeEnum::Externref;
       default:
         UNREACHABLE();
     }
@@ -553,7 +573,14 @@ class WasmValueMirror final : public ValueMirror {
         return String16::fromDouble(
             unpackWasmValue<double>(context, m_value->bytes()));
       }
-      case kAnyRef: {
+      case kS128: {
+        *serializable = false;
+        auto bytes = m_value->bytes();
+        DCHECK_EQ(16, bytes->Length());
+        auto s128 = unpackWasmValue<std::array<uint8_t, 16>>(context, bytes);
+        return descriptionForWasmS128(s128);
+      }
+      case kExternRef: {
         return descriptionForObject(context->GetIsolate(),
                                     m_value->ref().As<v8::Object>());
       }
@@ -856,7 +883,7 @@ bool isArrayLike(v8::Local<v8::Context> context, v8::Local<v8::Value> value,
       !lengthValue->IsUint32()) {
     return false;
   }
-  *length = v8::Local<v8::Uint32>::Cast(lengthValue)->Value();
+  *length = lengthValue.As<v8::Uint32>()->Value();
   return true;
 }
 
@@ -896,11 +923,11 @@ struct EntryMirror {
 
 class PreviewPropertyAccumulator : public ValueMirror::PropertyAccumulator {
  public:
-  PreviewPropertyAccumulator(const std::vector<String16>& blacklist,
+  PreviewPropertyAccumulator(const std::vector<String16>& blocklist,
                              int skipIndex, int* nameLimit, int* indexLimit,
                              bool* overflow,
                              std::vector<PropertyMirror>* mirrors)
-      : m_blacklist(blacklist),
+      : m_blocklist(blocklist),
         m_skipIndex(skipIndex),
         m_nameLimit(nameLimit),
         m_indexLimit(indexLimit),
@@ -914,8 +941,8 @@ class PreviewPropertyAccumulator : public ValueMirror::PropertyAccumulator {
       return true;
     }
     if (!mirror.isOwn) return true;
-    if (std::find(m_blacklist.begin(), m_blacklist.end(), mirror.name) !=
-        m_blacklist.end()) {
+    if (std::find(m_blocklist.begin(), m_blocklist.end(), mirror.name) !=
+        m_blocklist.end()) {
       return true;
     }
     if (mirror.isIndex && m_skipIndex > 0) {
@@ -933,7 +960,7 @@ class PreviewPropertyAccumulator : public ValueMirror::PropertyAccumulator {
   }
 
  private:
-  std::vector<String16> m_blacklist;
+  std::vector<String16> m_blocklist;
   int m_skipIndex;
   int* m_nameLimit;
   int* m_indexLimit;
@@ -945,27 +972,27 @@ bool getPropertiesForPreview(v8::Local<v8::Context> context,
                              v8::Local<v8::Object> object, int* nameLimit,
                              int* indexLimit, bool* overflow,
                              std::vector<PropertyMirror>* properties) {
-  std::vector<String16> blacklist;
+  std::vector<String16> blocklist;
   size_t length = 0;
   if (object->IsArray() || isArrayLike(context, object, &length) ||
       object->IsStringObject()) {
-    blacklist.push_back("length");
+    blocklist.push_back("length");
   } else {
     auto clientSubtype = clientFor(context)->valueSubtype(object);
     if (clientSubtype && toString16(clientSubtype->string()) == "array") {
-      blacklist.push_back("length");
+      blocklist.push_back("length");
     }
   }
   if (object->IsArrayBuffer() || object->IsSharedArrayBuffer()) {
-    blacklist.push_back("[[Int8Array]]");
-    blacklist.push_back("[[Uint8Array]]");
-    blacklist.push_back("[[Int16Array]]");
-    blacklist.push_back("[[Int32Array]]");
+    blocklist.push_back("[[Int8Array]]");
+    blocklist.push_back("[[Uint8Array]]");
+    blocklist.push_back("[[Int16Array]]");
+    blocklist.push_back("[[Int32Array]]");
   }
   int skipIndex = object->IsStringObject()
                       ? object.As<v8::StringObject>()->ValueOf()->Length() + 1
                       : -1;
-  PreviewPropertyAccumulator accumulator(blacklist, skipIndex, nameLimit,
+  PreviewPropertyAccumulator accumulator(blocklist, skipIndex, nameLimit,
                                          indexLimit, overflow, properties);
   return ValueMirror::getProperties(context, object, false, false,
                                     &accumulator);
@@ -977,20 +1004,20 @@ void getInternalPropertiesForPreview(
     std::vector<InternalPropertyMirror>* properties) {
   std::vector<InternalPropertyMirror> mirrors;
   ValueMirror::getInternalProperties(context, object, &mirrors);
-  std::vector<String16> whitelist;
+  std::vector<String16> allowlist;
   if (object->IsBooleanObject() || object->IsNumberObject() ||
       object->IsStringObject() || object->IsSymbolObject() ||
       object->IsBigIntObject()) {
-    whitelist.emplace_back("[[PrimitiveValue]]");
+    allowlist.emplace_back("[[PrimitiveValue]]");
   } else if (object->IsPromise()) {
-    whitelist.emplace_back("[[PromiseState]]");
-    whitelist.emplace_back("[[PromiseResult]]");
+    allowlist.emplace_back("[[PromiseState]]");
+    allowlist.emplace_back("[[PromiseResult]]");
   } else if (object->IsGeneratorObject()) {
-    whitelist.emplace_back("[[GeneratorState]]");
+    allowlist.emplace_back("[[GeneratorState]]");
   }
   for (auto& mirror : mirrors) {
-    if (std::find(whitelist.begin(), whitelist.end(), mirror.name) ==
-        whitelist.end()) {
+    if (std::find(allowlist.begin(), allowlist.end(), mirror.name) ==
+        allowlist.end()) {
       continue;
     }
     if (!*nameLimit) {
@@ -1008,7 +1035,6 @@ void getPrivatePropertiesForPreview(
     protocol::Array<PropertyPreview>* privateProperties) {
   std::vector<PrivatePropertyMirror> mirrors =
       ValueMirror::getPrivateProperties(context, object);
-  std::vector<String16> whitelist;
   for (auto& mirror : mirrors) {
     std::unique_ptr<PropertyPreview> propertyPreview;
     if (mirror.value) {
@@ -1717,6 +1743,12 @@ std::unique_ptr<ValueMirror> clientMirror(v8::Local<v8::Context> context,
                                           v8::Local<v8::Value> value,
                                           const String16& subtype) {
   // TODO(alph): description and length retrieval should move to embedder.
+  auto descriptionForValueSubtype =
+      clientFor(context)->descriptionForValueSubtype(context, value);
+  if (descriptionForValueSubtype) {
+    return std::make_unique<ObjectMirror>(
+        value, subtype, toString16(descriptionForValueSubtype->string()));
+  }
   if (subtype == "node") {
     return std::make_unique<ObjectMirror>(value, subtype,
                                           descriptionForNode(context, value));
@@ -1872,7 +1904,7 @@ std::unique_ptr<ValueMirror> ValueMirror::create(v8::Local<v8::Context> context,
         descriptionForCollection(isolate, view, view->ByteLength()));
   }
   V8InternalValueType internalType =
-      v8InternalValueTypeFrom(context, v8::Local<v8::Object>::Cast(value));
+      v8InternalValueTypeFrom(context, value.As<v8::Object>());
   if (value->IsArray() && internalType == V8InternalValueType::kScopeList) {
     return std::make_unique<ObjectMirror>(
         value, "internal#scopeList",

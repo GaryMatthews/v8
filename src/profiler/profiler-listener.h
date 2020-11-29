@@ -29,6 +29,8 @@ class V8_EXPORT_PRIVATE ProfilerListener : public CodeEventListener {
   ProfilerListener(Isolate*, CodeEventObserver*,
                    CpuProfilingNamingMode mode = kDebugNaming);
   ~ProfilerListener() override;
+  ProfilerListener(const ProfilerListener&) = delete;
+  ProfilerListener& operator=(const ProfilerListener&) = delete;
 
   void CodeCreateEvent(LogEventsAndTags tag, Handle<AbstractCode> code,
                        const char* name) override;
@@ -50,12 +52,14 @@ class V8_EXPORT_PRIVATE ProfilerListener : public CodeEventListener {
                              Handle<String> source) override;
   void CodeMoveEvent(AbstractCode from, AbstractCode to) override;
   void SharedFunctionInfoMoveEvent(Address from, Address to) override {}
-  void NativeContextMoveEvent(Address from, Address to) override;
   void CodeMovingGCEvent() override {}
   void CodeDisableOptEvent(Handle<AbstractCode> code,
                            Handle<SharedFunctionInfo> shared) override;
   void CodeDeoptEvent(Handle<Code> code, DeoptimizeKind kind, Address pc,
-                      int fp_to_sp_delta) override;
+                      int fp_to_sp_delta, bool reuse_code) override;
+  void CodeDependencyChangeEvent(Handle<Code> code,
+                                 Handle<SharedFunctionInfo> sfi,
+                                 const char* reason) override {}
 
   const char* GetName(Name name) {
     return function_and_resource_names_.GetName(name);
@@ -86,8 +90,6 @@ class V8_EXPORT_PRIVATE ProfilerListener : public CodeEventListener {
   CodeEventObserver* observer_;
   StringsStorage function_and_resource_names_;
   const CpuProfilingNamingMode naming_mode_;
-
-  DISALLOW_COPY_AND_ASSIGN(ProfilerListener);
 };
 
 }  // namespace internal

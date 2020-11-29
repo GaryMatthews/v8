@@ -46,16 +46,6 @@ extern runtime BigIntBinaryOp(
     Context, Numeric, Numeric, SmiTagged<Operation>): BigInt;
 }  // namespace runtime
 
-// Disambiguate macros with the same name as JS builtins.
-// TODO(bbudge) Clean this up with appropriate namespaces.
-macro NumberIsNaNImpl(number: Number): bool {
-  return NumberIsNaN(number);
-}
-
-macro StrictEqualImpl(left: JSAny, right: JSAny): Boolean {
-  return StrictEqual(left, right);
-}
-
 namespace number {
 extern macro NaNStringConstant(): String;
 extern macro ZeroStringConstant(): String;
@@ -65,12 +55,65 @@ extern macro MinusInfinityStringConstant(): String;
 const kAsciiZero: constexpr int32 = 48;        // '0' (ascii)
 const kAsciiLowerCaseA: constexpr int32 = 97;  // 'a' (ascii)
 
-extern macro NumberToString(Number): String;
-
 transitioning macro ThisNumberValue(implicit context: Context)(
     receiver: JSAny, method: constexpr string): Number {
   return UnsafeCast<Number>(
       ToThisValue(receiver, PrimitiveType::kNumber, method));
+}
+
+macro ToCharCode(input: int32): char8 {
+  assert(0 <= input && input < 36);
+  return input < 10 ? %RawDownCast<char8>(input + kAsciiZero) :
+                      %RawDownCast<char8>(input - 10 + kAsciiLowerCaseA);
+}
+
+@export
+macro NumberToStringSmi(x: int32, radix: int32): String labels Slow {
+  const isNegative: bool = x < 0;
+  let n: int32 = x;
+  if (!isNegative) {
+    // Fast case where the result is a one character string.
+    if (x < radix) {
+      return StringFromSingleCharCode(ToCharCode(n));
+    }
+  } else {
+    assert(isNegative);
+    if (n == kMinInt32) {
+      goto Slow;
+    }
+    n = 0 - n;
+  }
+
+  // Calculate length and pre-allocate the result string.
+  let temp: int32 = n;
+  let length: int32 = isNegative ? 1 : 0;
+  while (temp > 0) {
+    temp = temp / radix;
+    length = length + 1;
+  }
+  assert(length > 0);
+  const strSeq: SeqOneByteString = AllocateSeqOneByteString(Unsigned(length));
+  let cursor: intptr = Convert<intptr>(length) - 1;
+  while (n > 0) {
+    const digit: int32 = n % radix;
+    n = n / radix;
+    strSeq.chars[cursor] = ToCharCode(digit);
+    cursor = cursor - 1;
+  }
+  if (isNegative) {
+    assert(cursor == 0);
+    // Insert '-' to result.
+    strSeq.chars[0] = 45;
+  } else {
+    assert(cursor == -1);
+    // In sync with Factory::SmiToString: If radix = 10 and positive number,
+    // update hash for string.
+    if (radix == 10) {
+      assert(strSeq.raw_hash_field == kNameEmptyHashField);
+      strSeq.raw_hash_field = MakeArrayIndexHash(Unsigned(x), Unsigned(length));
+    }
+  }
+  return strSeq;
 }
 
 // https://tc39.github.io/ecma262/#sec-number.prototype.tostring
@@ -98,34 +141,29 @@ transitioning javascript builtin NumberPrototypeToString(
   // 7. Return the String representation of this Number
   //    value using the radix specified by radixNumber.
 
-  // Fast case where the result is a one character string.
-  if (TaggedIsPositiveSmi(x) && x < radixNumber) {
-    let charCode = Convert<int32>(UnsafeCast<Smi>(x));
-    if (charCode < 10) {
-      charCode += kAsciiZero;
-    } else {
-      charCode = charCode - 10 + kAsciiLowerCaseA;
-    }
-    return StringFromSingleCharCode(charCode);
+  if (TaggedIsSmi(x)) {
+    return NumberToStringSmi(Convert<int32>(x), Convert<int32>(radixNumber))
+        otherwise return runtime::DoubleToStringWithRadix(x, radixNumber);
   }
 
   if (x == -0) {
     return ZeroStringConstant();
-  } else if (NumberIsNaNImpl(x)) {
+  } else if (::NumberIsNaN(x)) {
     return NaNStringConstant();
   } else if (x == V8_INFINITY) {
     return InfinityStringConstant();
   } else if (x == MINUS_V8_INFINITY) {
     return MinusInfinityStringConstant();
   }
+
   return runtime::DoubleToStringWithRadix(x, radixNumber);
 }
 
 // ES6 #sec-number.isfinite
 javascript builtin NumberIsFinite(
     js-implicit context: NativeContext,
-    receiver: JSAny)(...arguments): Boolean {
-  typeswitch (arguments[0]) {
+    receiver: JSAny)(value: JSAny): Boolean {
+  typeswitch (value) {
     case (Smi): {
       return True;
     }
@@ -142,14 +180,14 @@ javascript builtin NumberIsFinite(
 
 // ES6 #sec-number.isinteger
 javascript builtin NumberIsInteger(js-implicit context: NativeContext)(
-    ...arguments): Boolean {
-  return SelectBooleanConstant(IsInteger(arguments[0]));
+    value: JSAny): Boolean {
+  return SelectBooleanConstant(IsInteger(value));
 }
 
 // ES6 #sec-number.isnan
 javascript builtin NumberIsNaN(js-implicit context: NativeContext)(
-    ...arguments): Boolean {
-  typeswitch (arguments[0]) {
+    value: JSAny): Boolean {
+  typeswitch (value) {
     case (Smi): {
       return False;
     }
@@ -165,23 +203,22 @@ javascript builtin NumberIsNaN(js-implicit context: NativeContext)(
 
 // ES6 #sec-number.issafeinteger
 javascript builtin NumberIsSafeInteger(js-implicit context: NativeContext)(
-    ...arguments): Boolean {
-  return SelectBooleanConstant(IsSafeInteger(arguments[0]));
+    value: JSAny): Boolean {
+  return SelectBooleanConstant(IsSafeInteger(value));
 }
 
 // ES6 #sec-number.prototype.valueof
 transitioning javascript builtin NumberPrototypeValueOf(
-    js-implicit context: NativeContext, receiver: JSAny)(...arguments): JSAny {
+    js-implicit context: NativeContext, receiver: JSAny)(): JSAny {
   return ToThisValue(
       receiver, PrimitiveType::kNumber, 'Number.prototype.valueOf');
 }
 
 // ES6 #sec-number.parsefloat
 transitioning javascript builtin NumberParseFloat(
-    js-implicit context: NativeContext)(...arguments): Number {
-  const input: JSAny = arguments[0];
+    js-implicit context: NativeContext)(value: JSAny): Number {
   try {
-    typeswitch (input) {
+    typeswitch (value) {
       case (s: Smi): {
         return s;
       }
@@ -194,12 +231,12 @@ transitioning javascript builtin NumberParseFloat(
         goto String(s);
       }
       case (HeapObject): {
-        goto String(string::ToString(context, input));
+        goto String(string::ToString(context, value));
       }
     }
   } label String(s: String) {
     // Check if the string is a cached array index.
-    const hash: NameHash = s.hash_field;
+    const hash: NameHash = s.raw_hash_field;
     if (!hash.is_not_integer_index_mask &&
         hash.array_index_length < kMaxCachedArrayIndexLength) {
       const arrayIndex: uint32 = hash.array_index_value;
@@ -250,7 +287,7 @@ transitioning builtin ParseInt(implicit context: Context)(
     return ChangeInt32ToTagged(i);
   } label String(s: String) {
     // Check if the string is a cached array index.
-    const hash: NameHash = s.hash_field;
+    const hash: NameHash = s.raw_hash_field;
     if (!hash.is_not_integer_index_mask &&
         hash.array_index_length < kMaxCachedArrayIndexLength) {
       const arrayIndex: uint32 = hash.array_index_value;
@@ -265,16 +302,18 @@ transitioning builtin ParseInt(implicit context: Context)(
 
 // ES6 #sec-number.parseint
 transitioning javascript builtin NumberParseInt(
-    js-implicit context: NativeContext)(...arguments): Number {
-  const input: JSAny = arguments[0];
-  const radix: JSAny = arguments[1];
-  return ParseInt(input, radix);
+    js-implicit context: NativeContext)(value: JSAny, radix: JSAny): Number {
+  return ParseInt(value, radix);
 }
 
 extern builtin NonNumberToNumeric(implicit context: Context)(JSAny): Numeric;
 extern builtin BitwiseXor(implicit context: Context)(Number, Number): Number;
 extern builtin Subtract(implicit context: Context)(Number, Number): Number;
 extern builtin Add(implicit context: Context)(Number, Number): Number;
+extern builtin StringAddConvertLeft(implicit context: Context)(
+    JSAny, String): JSAny;
+extern builtin StringAddConvertRight(implicit context: Context)(
+    String, JSAny): JSAny;
 
 extern macro BitwiseOp(int32, int32, constexpr Operation): Number;
 extern macro RelationalComparison(
@@ -282,6 +321,119 @@ extern macro RelationalComparison(
 
 // TODO(bbudge) Use a simpler macro structure that doesn't loop when converting
 // non-numbers, if such a code sequence doesn't make the builtin bigger.
+
+transitioning macro ToNumericOrPrimitive(implicit context: Context)(
+    value: JSAny): JSAny {
+  typeswitch (value) {
+    case (v: JSReceiver): {
+      return NonPrimitiveToPrimitive_Default(context, v);
+    }
+    case (v: JSPrimitive): {
+      return NonNumberToNumeric(v);
+    }
+  }
+}
+
+transitioning builtin Add(implicit context: Context)(
+    leftArg: JSAny, rightArg: JSAny): JSAny {
+  let left: JSAny = leftArg;
+  let right: JSAny = rightArg;
+  try {
+    while (true) {
+      typeswitch (left) {
+        case (left: Smi): {
+          typeswitch (right) {
+            case (right: Smi): {
+              return math::TrySmiAdd(left, right) otherwise goto Float64s(
+                  SmiToFloat64(left), SmiToFloat64(right));
+            }
+            case (right: HeapNumber): {
+              goto Float64s(SmiToFloat64(left), Convert<float64>(right));
+            }
+            case (right: BigInt): {
+              goto Numerics(left, right);
+            }
+            case (right: String): {
+              goto StringAddConvertLeft(left, right);
+            }
+            case (HeapObject): {
+              right = ToNumericOrPrimitive(right);
+              continue;
+            }
+          }
+        }
+        case (left: HeapNumber): {
+          typeswitch (right) {
+            case (right: Smi): {
+              goto Float64s(Convert<float64>(left), SmiToFloat64(right));
+            }
+            case (right: HeapNumber): {
+              goto Float64s(Convert<float64>(left), Convert<float64>(right));
+            }
+            case (right: BigInt): {
+              goto Numerics(left, right);
+            }
+            case (right: String): {
+              goto StringAddConvertLeft(left, right);
+            }
+            case (HeapObject): {
+              right = ToNumericOrPrimitive(right);
+              continue;
+            }
+          }
+        }
+        case (left: BigInt): {
+          typeswitch (right) {
+            case (right: Numeric): {
+              goto Numerics(left, right);
+            }
+            case (right: String): {
+              goto StringAddConvertLeft(left, right);
+            }
+            case (HeapObject): {
+              right = ToNumericOrPrimitive(right);
+              continue;
+            }
+          }
+        }
+        case (left: String): {
+          goto StringAddConvertRight(left, right);
+        }
+        case (leftReceiver: JSReceiver): {
+          left = ToPrimitiveDefault(leftReceiver);
+        }
+        case (HeapObject): {
+          // left: HeapObject
+          typeswitch (right) {
+            case (right: String): {
+              goto StringAddConvertLeft(left, right);
+            }
+            case (rightReceiver: JSReceiver): {
+              // left is JSPrimitive and right is JSReceiver, convert right
+              // with priority.
+              right = ToPrimitiveDefault(rightReceiver);
+              continue;
+            }
+            case (JSPrimitive): {
+              // Neither left or right is JSReceiver, convert left.
+              left = NonNumberToNumeric(left);
+              continue;
+            }
+          }
+        }
+      }
+    }
+  } label StringAddConvertLeft(left: JSAny, right: String) {
+    tail StringAddConvertLeft(left, right);
+  } label StringAddConvertRight(left: String, right: JSAny) {
+    tail StringAddConvertRight(left, right);
+  } label Numerics(left: Numeric, right: Numeric) {
+    tail bigint::BigIntAdd(left, right);
+  } label Float64s(left: float64, right: float64) {
+    return AllocateHeapNumberWithValue(left + right);
+  }
+  unreachable;
+}
 
 // Unary type switch on Number | BigInt.
 macro UnaryOp1(implicit context: Context)(value: JSAny): never labels
@@ -369,7 +521,7 @@ Number(Number, Number), AtLeastOneBigInt(Numeric, Numeric) {
   unreachable;
 }
 
-// Binary type switch on Number | BigInt.
+// Binary type switch on Smi | HeapNumber | BigInt.
 macro BinaryOp2(implicit context: Context)(leftVal: JSAny, rightVal: JSAny):
     never labels Smis(Smi, Smi), Float64s(float64, float64),
     AtLeastOneBigInt(Numeric, Numeric) {
@@ -639,7 +791,7 @@ builtin Equal(implicit context: Context)(left: JSAny, right: JSAny): Object {
 
 builtin StrictEqual(implicit context: Context)(
     left: JSAny, right: JSAny): Object {
-  return StrictEqualImpl(left, right);
+  return ::StrictEqual(left, right);
 }
 
 }  // namespace number

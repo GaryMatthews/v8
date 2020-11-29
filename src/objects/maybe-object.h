@@ -5,7 +5,6 @@
 #ifndef V8_OBJECTS_MAYBE_OBJECT_H_
 #define V8_OBJECTS_MAYBE_OBJECT_H_
 
-#include "src/execution/local-isolate-wrapper.h"
 #include "src/objects/tagged-impl.h"
 
 namespace v8 {
@@ -28,6 +27,10 @@ class MaybeObject : public TaggedImpl<HeapObjectReferenceType::WEAK, Address> {
 
   V8_INLINE static MaybeObject MakeWeak(MaybeObject object);
 
+  V8_INLINE static MaybeObject Create(MaybeObject o);
+  V8_INLINE static MaybeObject Create(Object o);
+  V8_INLINE static MaybeObject Create(Smi smi);
+
 #ifdef VERIFY_HEAP
   static void VerifyMaybeObjectPointer(Isolate* isolate, MaybeObject p);
 #endif
@@ -48,13 +51,10 @@ class HeapObjectReference : public MaybeObject {
 
   V8_INLINE static HeapObjectReference Weak(Object object);
 
-  V8_INLINE static HeapObjectReference ClearedValue(const Isolate* isolate);
+  V8_INLINE static HeapObjectReference From(Object object,
+                                            HeapObjectReferenceType type);
 
-  V8_INLINE static HeapObjectReference ClearedValue(
-      const OffThreadIsolate* isolate);
-
-  V8_INLINE static HeapObjectReference ClearedValue(
-      LocalIsolateWrapper isolate);
+  V8_INLINE static HeapObjectReference ClearedValue(IsolateRoot isolate);
 
   template <typename THeapObjectSlot>
   V8_INLINE static void Update(THeapObjectSlot slot, HeapObject value);

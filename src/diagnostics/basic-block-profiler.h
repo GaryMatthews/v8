@@ -14,32 +14,39 @@
 #include "src/base/macros.h"
 #include "src/base/platform/mutex.h"
 #include "src/common/globals.h"
-#include "torque-generated/exported-class-definitions-tq.h"
+#include "src/objects/shared-function-info.h"
 
 namespace v8 {
 namespace internal {
+
+class OnHeapBasicBlockProfilerData;
 
 class BasicBlockProfilerData {
  public:
   explicit BasicBlockProfilerData(size_t n_blocks);
   V8_EXPORT_PRIVATE BasicBlockProfilerData(
       Handle<OnHeapBasicBlockProfilerData> js_heap_data, Isolate* isolate);
+  V8_EXPORT_PRIVATE BasicBlockProfilerData(
+      OnHeapBasicBlockProfilerData js_heap_data);
 
   size_t n_blocks() const {
-    DCHECK_EQ(block_rpo_numbers_.size(), counts_.size());
-    return block_rpo_numbers_.size();
+    DCHECK_EQ(block_ids_.size(), counts_.size());
+    return block_ids_.size();
   }
-  const uint32_t* counts() const { return &counts_[0]; }
+  const double* counts() const { return &counts_[0]; }
 
   void SetCode(const std::ostringstream& os);
   void SetFunctionName(std::unique_ptr<char[]> name);
   void SetSchedule(const std::ostringstream& os);
-  void SetBlockRpoNumber(size_t offset, int32_t block_rpo);
+  void SetBlockId(size_t offset, int32_t id);
+  void SetHash(int hash);
 
   // Copy the data from this object into an equivalent object stored on the JS
   // heap, so that it can survive snapshotting and relocation. This must
   // happen on the main thread during finalization of the compilation.
   Handle<OnHeapBasicBlockProfilerData> CopyToJSHeap(Isolate* isolate);
+
+  void Log(Isolate* isolate);
 
  private:
   friend class BasicBlockProfiler;
@@ -48,11 +55,15 @@ class BasicBlockProfilerData {
 
   V8_EXPORT_PRIVATE void ResetCounts();
 
-  std::vector<int32_t> block_rpo_numbers_;
-  std::vector<uint32_t> counts_;
+  void CopyFromJSHeap(OnHeapBasicBlockProfilerData js_heap_data);
+
+  // These vectors are indexed by reverse post-order block number.
+  std::vector<int32_t> block_ids_;
+  std::vector<double> counts_;
   std::string function_name_;
   std::string schedule_;
   std::string code_;
+  int hash_ = 0;
   DISALLOW_COPY_AND_ASSIGN(BasicBlockProfilerData);
 };
 
@@ -66,7 +77,13 @@ class BasicBlockProfiler {
   V8_EXPORT_PRIVATE static BasicBlockProfiler* Get();
   BasicBlockProfilerData* NewData(size_t n_blocks);
   V8_EXPORT_PRIVATE void ResetCounts(Isolate* isolate);
+  V8_EXPORT_PRIVATE bool HasData(Isolate* isolate);
   V8_EXPORT_PRIVATE void Print(std::ostream& os, Isolate* isolate);
+
+  // Coverage bitmap in this context includes only on heap BasicBlockProfiler
+  // data. It is used to export coverage of builtins function loaded from
+  // snapshot.
+  V8_EXPORT_PRIVATE std::vector<bool> GetCoverageBitmap(Isolate* isolate);
 
   const DataList* data_list() { return &data_list_; }
 

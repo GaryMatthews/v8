@@ -9,12 +9,11 @@
 #include "include/cppgc/internal/api-constants.h"
 #include "src/base/logging.h"
 #include "src/heap/cppgc/globals.h"
-#include "src/heap/cppgc/heap-object-header-inl.h"
+#include "src/heap/cppgc/heap-object-header.h"
 #include "src/heap/cppgc/heap-space.h"
 #include "src/heap/cppgc/heap.h"
-#include "src/heap/cppgc/object-start-bitmap-inl.h"
 #include "src/heap/cppgc/object-start-bitmap.h"
-#include "src/heap/cppgc/page-memory-inl.h"
+#include "src/heap/cppgc/page-memory.h"
 #include "src/heap/cppgc/raw-heap.h"
 
 namespace cppgc {
@@ -27,63 +26,46 @@ Address AlignAddress(Address address, size_t alignment) {
       RoundUp(reinterpret_cast<uintptr_t>(address), alignment));
 }
 
-const HeapObjectHeader* ObjectHeaderFromInnerAddressImpl(const BasePage* page,
-                                                         const void* address) {
-  if (page->is_large()) {
-    return LargePage::From(page)->ObjectHeader();
-  }
-  const ObjectStartBitmap& bitmap =
-      NormalPage::From(page)->object_start_bitmap();
-  const HeapObjectHeader* header =
-      bitmap.FindHeader(static_cast<ConstAddress>(address));
-  DCHECK_LT(address,
-            reinterpret_cast<ConstAddress>(header) +
-                header->GetSize<HeapObjectHeader::AccessMode::kAtomic>());
-  return header;
-}
-
 }  // namespace
 
-STATIC_ASSERT(kPageSize == api_constants::kPageAlignment);
-
 // static
-BasePage* BasePage::FromPayload(void* payload) {
-  return reinterpret_cast<BasePage*>(
-      (reinterpret_cast<uintptr_t>(payload) & kPageBaseMask) + kGuardPageSize);
-}
-
-// static
-const BasePage* BasePage::FromPayload(const void* payload) {
-  return reinterpret_cast<const BasePage*>(
-      (reinterpret_cast<uintptr_t>(const_cast<void*>(payload)) &
-       kPageBaseMask) +
-      kGuardPageSize);
-}
-
-// static
-BasePage* BasePage::FromInnerAddress(const Heap* heap, void* address) {
+BasePage* BasePage::FromInnerAddress(const HeapBase* heap, void* address) {
   return const_cast<BasePage*>(
       FromInnerAddress(heap, const_cast<const void*>(address)));
 }
 
 // static
-const BasePage* BasePage::FromInnerAddress(const Heap* heap,
+const BasePage* BasePage::FromInnerAddress(const HeapBase* heap,
                                            const void* address) {
   return reinterpret_cast<const BasePage*>(
       heap->page_backend()->Lookup(static_cast<ConstAddress>(address)));
 }
 
-HeapObjectHeader& BasePage::ObjectHeaderFromInnerAddress(void* address) const {
-  return const_cast<HeapObjectHeader&>(
-      ObjectHeaderFromInnerAddress(const_cast<const void*>(address)));
+// static
+void BasePage::Destroy(BasePage* page) {
+  if (page->is_large()) {
+    LargePage::Destroy(LargePage::From(page));
+  } else {
+    NormalPage::Destroy(NormalPage::From(page));
+  }
 }
 
-const HeapObjectHeader& BasePage::ObjectHeaderFromInnerAddress(
-    const void* address) const {
-  const HeapObjectHeader* header =
-      ObjectHeaderFromInnerAddressImpl(this, address);
-  DCHECK_NE(kFreeListGCInfoIndex, header->GetGCInfoIndex());
-  return *header;
+Address BasePage::PayloadStart() {
+  return is_large() ? LargePage::From(this)->PayloadStart()
+                    : NormalPage::From(this)->PayloadStart();
+}
+
+ConstAddress BasePage::PayloadStart() const {
+  return const_cast<BasePage*>(this)->PayloadStart();
+}
+
+Address BasePage::PayloadEnd() {
+  return is_large() ? LargePage::From(this)->PayloadEnd()
+                    : NormalPage::From(this)->PayloadEnd();
+}
+
+ConstAddress BasePage::PayloadEnd() const {
+  return const_cast<BasePage*>(this)->PayloadEnd();
 }
 
 HeapObjectHeader* BasePage::TryObjectHeaderFromInnerAddress(
@@ -116,24 +98,21 @@ const HeapObjectHeader* BasePage::TryObjectHeaderFromInnerAddress(
   return header;
 }
 
-BasePage::BasePage(Heap* heap, BaseSpace* space, PageType type)
+BasePage::BasePage(HeapBase* heap, BaseSpace* space, PageType type)
     : heap_(heap), space_(space), type_(type) {
   DCHECK_EQ(0u, (reinterpret_cast<uintptr_t>(this) - kGuardPageSize) &
                     kPageOffsetMask);
-  DCHECK_EQ(reinterpret_cast<void*>(&heap_),
-            FromPayload(this) + api_constants::kHeapOffset);
   DCHECK_EQ(&heap_->raw_heap(), space_->raw_heap());
 }
 
 // static
-NormalPage* NormalPage::Create(NormalPageSpace* space) {
-  DCHECK(space);
-  Heap* heap = space->raw_heap()->heap();
-  DCHECK(heap);
-  void* memory = heap->page_backend()->AllocateNormalPageMemory(space->index());
-  auto* normal_page = new (memory) NormalPage(heap, space);
-  space->AddPage(normal_page);
-  space->AddToFreeList(normal_page->PayloadStart(), normal_page->PayloadSize());
+NormalPage* NormalPage::Create(PageBackend* page_backend,
+                               NormalPageSpace* space) {
+  DCHECK_NOT_NULL(page_backend);
+  DCHECK_NOT_NULL(space);
+  void* memory = page_backend->AllocateNormalPageMemory(space->index());
+  auto* normal_page = new (memory) NormalPage(space->raw_heap()->heap(), space);
+  normal_page->SynchronizedStore();
   return normal_page;
 }
 
@@ -148,7 +127,7 @@ void NormalPage::Destroy(NormalPage* page) {
                                 reinterpret_cast<Address>(page));
 }
 
-NormalPage::NormalPage(Heap* heap, BaseSpace* space)
+NormalPage::NormalPage(HeapBase* heap, BaseSpace* space)
     : BasePage(heap, space, PageType::kNormal),
       object_start_bitmap_(PayloadStart()) {
   DCHECK_LT(kLargeObjectSizeThreshold,
@@ -192,23 +171,26 @@ size_t NormalPage::PayloadSize() {
   return kPageSize - 2 * kGuardPageSize - header_size;
 }
 
-LargePage::LargePage(Heap* heap, BaseSpace* space, size_t size)
+LargePage::LargePage(HeapBase* heap, BaseSpace* space, size_t size)
     : BasePage(heap, space, PageType::kLarge), payload_size_(size) {}
 
 LargePage::~LargePage() = default;
 
 // static
-LargePage* LargePage::Create(LargePageSpace* space, size_t size) {
-  DCHECK(space);
+LargePage* LargePage::Create(PageBackend* page_backend, LargePageSpace* space,
+                             size_t size) {
+  DCHECK_NOT_NULL(page_backend);
+  DCHECK_NOT_NULL(space);
   DCHECK_LE(kLargeObjectSizeThreshold, size);
+
   const size_t page_header_size =
       RoundUp(sizeof(LargePage), kAllocationGranularity);
   const size_t allocation_size = page_header_size + size;
 
-  Heap* heap = space->raw_heap()->heap();
-  void* memory = heap->page_backend()->AllocateLargePageMemory(allocation_size);
+  auto* heap = space->raw_heap()->heap();
+  void* memory = page_backend->AllocateLargePageMemory(allocation_size);
   LargePage* page = new (memory) LargePage(heap, space, size);
-  space->AddPage(page);
+  page->SynchronizedStore();
   return page;
 }
 

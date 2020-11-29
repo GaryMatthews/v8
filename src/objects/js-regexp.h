@@ -6,13 +6,15 @@
 #define V8_OBJECTS_JS_REGEXP_H_
 
 #include "src/objects/js-array.h"
-#include "torque-generated/bit-fields-tq.h"
+#include "torque-generated/bit-fields.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
 namespace v8 {
 namespace internal {
+
+#include "torque-generated/src/objects/js-regexp-tq.inc"
 
 // Regular expressions
 // The regular expression holds a single reference to a FixedArray in
@@ -36,21 +38,22 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   // NOT_COMPILED: Initial value. No data has been stored in the JSRegExp yet.
   // ATOM: A simple string to match against using an indexOf operation.
   // IRREGEXP: Compiled with Irregexp.
-  enum Type { NOT_COMPILED, ATOM, IRREGEXP };
+  // EXPERIMENTAL: Compiled to use the new linear time engine.
+  enum Type { NOT_COMPILED, ATOM, IRREGEXP, EXPERIMENTAL };
   DEFINE_TORQUE_GENERATED_JS_REG_EXP_FLAGS()
 
-  static constexpr int kFlagCount = InvalidBit::kShift;
-
-  static constexpr Flag FlagFromChar(char c) {
-    STATIC_ASSERT(kFlagCount == 6);
+  static base::Optional<Flag> FlagFromChar(char c) {
+    STATIC_ASSERT(kFlagCount == 7);
     // clang-format off
-    return c == 'g' ? kGlobal
-         : c == 'i' ? kIgnoreCase
-         : c == 'm' ? kMultiline
-         : c == 'y' ? kSticky
-         : c == 'u' ? kUnicode
-         : c == 's' ? kDotAll
-         : kInvalid;
+    return c == 'g' ? base::Optional<Flag>(kGlobal)
+         : c == 'i' ? base::Optional<Flag>(kIgnoreCase)
+         : c == 'm' ? base::Optional<Flag>(kMultiline)
+         : c == 'y' ? base::Optional<Flag>(kSticky)
+         : c == 'u' ? base::Optional<Flag>(kUnicode)
+         : c == 's' ? base::Optional<Flag>(kDotAll)
+         : (FLAG_enable_experimental_regexp_engine && c == 'l')
+           ? base::Optional<Flag>(kLinear)
+         : base::Optional<Flag>();
     // clang-format on
   }
 
@@ -61,6 +64,7 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   STATIC_ASSERT(static_cast<int>(kSticky) == v8::RegExp::kSticky);
   STATIC_ASSERT(static_cast<int>(kUnicode) == v8::RegExp::kUnicode);
   STATIC_ASSERT(static_cast<int>(kDotAll) == v8::RegExp::kDotAll);
+  STATIC_ASSERT(static_cast<int>(kLinear) == v8::RegExp::kLinear);
   STATIC_ASSERT(kFlagCount == v8::RegExp::kFlagCount);
 
   DECL_ACCESSORS(last_index, Object)
@@ -83,12 +87,16 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   static Flags FlagsFromString(Isolate* isolate, Handle<String> flags,
                                bool* success);
 
+  bool CanTierUp();
   bool MarkedForTierUp();
   void ResetLastTierUpTick();
   void TierUpTick();
   void MarkTierUpForNextExec();
 
   inline Type TypeTag() const;
+  static bool TypeSupportsCaptures(Type t) {
+    return t == IRREGEXP || t == EXPERIMENTAL;
+  }
 
   // Maximum number of captures allowed.
   static constexpr int kMaxCaptures = 1 << 16;
@@ -105,6 +113,7 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   inline Object DataAt(int index) const;
   // Set implementation data after the object has been prepared.
   inline void SetDataAt(int index, Object value);
+  inline void SetCaptureNameMap(Handle<FixedArray> capture_name_map);
 
   static constexpr int code_index(bool is_latin1) {
     return is_latin1 ? kIrregexpLatin1CodeIndex : kIrregexpUC16CodeIndex;
@@ -139,6 +148,12 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   static const int kSourceIndex = kTagIndex + 1;
   static const int kFlagsIndex = kSourceIndex + 1;
   static const int kDataIndex = kFlagsIndex + 1;
+
+  // TODO(jgruber): Rename kDataIndex to something more appropriate.
+  // There is no 'data' field, kDataIndex is just a marker for the
+  // first non-generic index.
+  static constexpr int kMinDataArrayLength = kDataIndex;
+
   // The data fields are used in different ways depending on the
   // value of the tag.
   // Atom regexps (literal strings).
@@ -182,6 +197,15 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   // above to save space.
   static const int kIrregexpBacktrackLimit = kDataIndex + 8;
   static const int kIrregexpDataSize = kDataIndex + 9;
+
+  // TODO(mbid,v8:10765): At the moment the EXPERIMENTAL data array conforms
+  // to the format of an IRREGEXP data array, with most fields set to some
+  // default/uninitialized value. This is because EXPERIMENTAL and IRREGEXP
+  // regexps take the same code path in `RegExpExecInternal`, which reads off
+  // various fields from the data array. `RegExpExecInternal` should probably
+  // distinguish between EXPERIMENTAL and IRREGEXP, and then we can get rid of
+  // all the IRREGEXP only fields.
+  static constexpr int kExperimentalDataSize = kIrregexpDataSize;
 
   // In-object fields.
   static const int kLastIndexFieldIndex = 0;

@@ -820,7 +820,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void vsqrt(const SwVfpRegister dst, const SwVfpRegister src,
              const Condition cond = al);
 
-  // ARMv8 rounding instructions.
+  // ARMv8 rounding instructions (Scalar).
   void vrinta(const SwVfpRegister dst, const SwVfpRegister src);
   void vrinta(const DwVfpRegister dst, const DwVfpRegister src);
   void vrintn(const SwVfpRegister dst, const SwVfpRegister src);
@@ -839,6 +839,9 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   // All these APIs support D0 to D31 and Q0 to Q15.
   void vld1(NeonSize size, const NeonListOperand& dst,
             const NeonMemOperand& src);
+  // vld1s(ingle element to one lane).
+  void vld1s(NeonSize size, const NeonListOperand& dst, uint8_t index,
+             const NeonMemOperand& src);
   void vld1r(NeonSize size, const NeonListOperand& dst,
              const NeonMemOperand& src);
   void vst1(NeonSize size, const NeonListOperand& src,
@@ -853,6 +856,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void vmov(NeonDataType dt, DwVfpRegister dst, int index, Register src);
   void vmov(NeonDataType dt, Register dst, DwVfpRegister src, int index);
 
+  void vmov(DwVfpRegister dst, uint64_t imm);
   void vmov(QwNeonRegister dst, uint64_t imm);
   void vmov(QwNeonRegister dst, QwNeonRegister src);
   void vdup(NeonSize size, QwNeonRegister dst, Register src);
@@ -908,6 +912,17 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
              DwVfpRegister src2);
   void vpmax(NeonDataType dt, DwVfpRegister dst, DwVfpRegister src1,
              DwVfpRegister src2);
+
+  // ARMv8 rounding instructions (NEON).
+  void vrintm(NeonDataType dt, const QwNeonRegister dst,
+              const QwNeonRegister src);
+  void vrintn(NeonDataType dt, const QwNeonRegister dst,
+              const QwNeonRegister src);
+  void vrintp(NeonDataType dt, const QwNeonRegister dst,
+              const QwNeonRegister src);
+  void vrintz(NeonDataType dt, const QwNeonRegister dst,
+              const QwNeonRegister src);
+
   void vshl(NeonDataType dt, QwNeonRegister dst, QwNeonRegister src, int shift);
   void vshl(NeonDataType dt, QwNeonRegister dst, QwNeonRegister src,
             QwNeonRegister shift);
@@ -1012,7 +1027,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   bool ImmediateFitsAddrMode2Instruction(int32_t imm32);
 
   // Class for scoping postponing the constant pool generation.
-  class BlockConstPoolScope {
+  class V8_NODISCARD BlockConstPoolScope {
    public:
     explicit BlockConstPoolScope(Assembler* assem) : assem_(assem) {
       assem_->StartBlockConstPool();
@@ -1324,7 +1339,7 @@ class PatchingAssembler : public Assembler {
 // state, even if the list is modified by some other means. Note that this scope
 // can be nested but the destructors need to run in the opposite order as the
 // constructors. We do not have assertions for this.
-class V8_EXPORT_PRIVATE UseScratchRegisterScope {
+class V8_EXPORT_PRIVATE V8_NODISCARD UseScratchRegisterScope {
  public:
   explicit UseScratchRegisterScope(Assembler* assembler);
   ~UseScratchRegisterScope();

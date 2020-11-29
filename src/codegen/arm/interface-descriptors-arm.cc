@@ -46,16 +46,16 @@ void EphemeronKeyBarrierDescriptor::InitializePlatformSpecific(
   data->InitializePlatformSpecific(kParameterCount, default_stub_registers);
 }
 
-const Register FastNewFunctionContextDescriptor::ScopeInfoRegister() {
-  return r1;
-}
-const Register FastNewFunctionContextDescriptor::SlotsRegister() { return r0; }
-
 const Register LoadDescriptor::ReceiverRegister() { return r1; }
 const Register LoadDescriptor::NameRegister() { return r2; }
 const Register LoadDescriptor::SlotRegister() { return r0; }
 
 const Register LoadWithVectorDescriptor::VectorRegister() { return r3; }
+
+const Register
+LoadWithReceiverAndVectorDescriptor::LookupStartObjectRegister() {
+  return r4;
+}
 
 const Register StoreDescriptor::ReceiverRegister() { return r1; }
 const Register StoreDescriptor::NameRegister() { return r2; }
@@ -276,54 +276,6 @@ void RunMicrotasksEntryDescriptor::InitializePlatformSpecific(
     CallInterfaceDescriptorData* data) {
   Register registers[] = {r0, r1};
   data->InitializePlatformSpecific(arraysize(registers), registers);
-}
-
-void BinaryOp_WithFeedbackDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  // TODO(v8:8888): Implement on this platform.
-  DefaultInitializePlatformSpecific(data, 4);
-}
-
-void CallTrampoline_WithFeedbackDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  // TODO(v8:8888): Implement on this platform.
-  DefaultInitializePlatformSpecific(data, 4);
-}
-
-void CallWithArrayLike_WithFeedbackDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  // TODO(v8:8888): Implement on this platform.
-  DefaultInitializePlatformSpecific(data, 4);
-}
-
-void CallWithSpread_WithFeedbackDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  // TODO(v8:8888): Implement on this platform.
-  DefaultInitializePlatformSpecific(data, 4);
-}
-
-void ConstructWithArrayLike_WithFeedbackDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  // TODO(v8:8888): Implement on this platform.
-  DefaultInitializePlatformSpecific(data, 4);
-}
-
-void ConstructWithSpread_WithFeedbackDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  // TODO(v8:8888): Implement on this platform.
-  DefaultInitializePlatformSpecific(data, 4);
-}
-
-void Compare_WithFeedbackDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  // TODO(v8:8888): Implement on this platform.
-  DefaultInitializePlatformSpecific(data, 4);
-}
-
-void UnaryOp_WithFeedbackDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  // TODO(v8:8888): Implement on this platform.
-  DefaultInitializePlatformSpecific(data, 3);
 }
 
 }  // namespace internal

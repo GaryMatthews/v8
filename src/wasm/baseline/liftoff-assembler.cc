@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "src/base/optional.h"
+#include "src/base/platform/wrappers.h"
 #include "src/codegen/assembler-inl.h"
 #include "src/codegen/macro-assembler-inl.h"
 #include "src/compiler/linkage.h"
@@ -71,6 +72,8 @@ class StackTransferRecipe {
 
  public:
   explicit StackTransferRecipe(LiftoffAssembler* wasm_asm) : asm_(wasm_asm) {}
+  StackTransferRecipe(const StackTransferRecipe&) = delete;
+  StackTransferRecipe& operator=(const StackTransferRecipe&) = delete;
   ~StackTransferRecipe() { Execute(); }
 
   void Execute() {
@@ -82,35 +85,35 @@ class StackTransferRecipe {
     DCHECK(load_dst_regs_.is_empty());
   }
 
-  void TransferStackSlot(const VarState& dst, const VarState& src) {
+  V8_INLINE void TransferStackSlot(const VarState& dst, const VarState& src) {
     DCHECK_EQ(dst.type(), src.type());
-    switch (dst.loc()) {
+    if (dst.is_reg()) {
+      LoadIntoRegister(dst.reg(), src, src.offset());
+      return;
+    }
+    if (dst.is_const()) {
+      DCHECK_EQ(dst.i32_const(), src.i32_const());
+      return;
+    }
+    DCHECK(dst.is_stack());
+    switch (src.loc()) {
       case VarState::kStack:
-        switch (src.loc()) {
-          case VarState::kStack:
-            if (src.offset() == dst.offset()) break;
-            asm_->MoveStackValue(dst.offset(), src.offset(), src.type());
-            break;
-          case VarState::kRegister:
-            asm_->Spill(dst.offset(), src.reg(), src.type());
-            break;
-          case VarState::kIntConst:
-            asm_->Spill(dst.offset(), src.constant());
-            break;
+        if (src.offset() != dst.offset()) {
+          asm_->MoveStackValue(dst.offset(), src.offset(), src.type());
         }
         break;
       case VarState::kRegister:
-        LoadIntoRegister(dst.reg(), src, src.offset());
+        asm_->Spill(dst.offset(), src.reg(), src.type());
         break;
       case VarState::kIntConst:
-        DCHECK_EQ(dst, src);
+        asm_->Spill(dst.offset(), src.constant());
         break;
     }
   }
 
-  void LoadIntoRegister(LiftoffRegister dst,
-                        const LiftoffAssembler::VarState& src,
-                        uint32_t src_offset) {
+  V8_INLINE void LoadIntoRegister(LiftoffRegister dst,
+                                  const LiftoffAssembler::VarState& src,
+                                  uint32_t src_offset) {
     switch (src.loc()) {
       case VarState::kStack:
         LoadStackSlot(dst, src_offset, src.type());
@@ -343,8 +346,6 @@ class StackTransferRecipe {
     }
     load_dst_regs_ = {};
   }
-
-  DISALLOW_COPY_AND_ASSIGN(StackTransferRecipe);
 };
 
 class RegisterReuseMap {
@@ -466,7 +467,7 @@ void LiftoffAssembler::CacheState::InitMerge(const CacheState& source,
   // they do not move). Try to keep register in registers, but avoid duplicates.
   InitMergeRegion(this, source_begin, target_begin, num_locals, kKeepStackSlots,
                   kConstantsNotAllowed, kNoReuseRegisters, used_regs);
-  // Sanity check: All the {used_regs} are really in use now.
+  // Consistency check: All the {used_regs} are really in use now.
   DCHECK_EQ(used_regs, used_registers & used_regs);
 
   // Last, initialize the section in between. Here, constants are allowed, but
@@ -488,11 +489,38 @@ void LiftoffAssembler::CacheState::Split(const CacheState& source) {
   *this = source;
 }
 
+void LiftoffAssembler::CacheState::DefineSafepoint(Safepoint& safepoint) {
+  for (auto slot : stack_state) {
+    DCHECK(!slot.is_reg());
+
+    if (slot.type().is_reference_type()) {
+      // index = 0 is for the stack slot at 'fp + kFixedFrameSizeAboveFp -
+      // kSystemPointerSize', the location of the current stack slot is 'fp -
+      // slot.offset()'. The index we need is therefore '(fp +
+      // kFixedFrameSizeAboveFp - kSystemPointerSize) - (fp - slot.offset())' =
+      // 'slot.offset() + kFixedFrameSizeAboveFp - kSystemPointerSize'.
+      auto index =
+          (slot.offset() + StandardFrameConstants::kFixedFrameSizeAboveFp -
+           kSystemPointerSize) /
+          kSystemPointerSize;
+      safepoint.DefinePointerSlot(index);
+    }
+  }
+}
+
+int LiftoffAssembler::GetTotalFrameSlotCountForGC() const {
+  // The GC does not care about the actual number of spill slots, just about
+  // the number of references that could be there in the spilling area. Note
+  // that the offset of the first spill slot is kSystemPointerSize and not
+  // '0'. Therefore we don't have to add '+1' here.
+  return (max_used_spill_offset_ +
+          StandardFrameConstants::kFixedFrameSizeAboveFp) /
+         kSystemPointerSize;
+}
+
 namespace {
 
-constexpr AssemblerOptions DefaultLiftoffOptions() {
-  return AssemblerOptions{};
-}
+AssemblerOptions DefaultLiftoffOptions() { return AssemblerOptions{}; }
 
 }  // namespace
 
@@ -504,30 +532,21 @@ LiftoffAssembler::LiftoffAssembler(std::unique_ptr<AssemblerBuffer> buffer)
 
 LiftoffAssembler::~LiftoffAssembler() {
   if (num_locals_ > kInlineLocalTypes) {
-    free(more_local_types_);
+    base::Free(more_local_types_);
   }
 }
 
 LiftoffRegister LiftoffAssembler::LoadToRegister(VarState slot,
                                                  LiftoffRegList pinned) {
-  switch (slot.loc()) {
-    case VarState::kStack: {
-      LiftoffRegister reg =
-          GetUnusedRegister(reg_class_for(slot.type()), pinned);
-      Fill(reg, slot.offset(), slot.type());
-      return reg;
-    }
-    case VarState::kRegister:
-      return slot.reg();
-    case VarState::kIntConst: {
-      RegClass rc =
-          kNeedI64RegPair && slot.type() == kWasmI64 ? kGpRegPair : kGpReg;
-      LiftoffRegister reg = GetUnusedRegister(rc, pinned);
-      LoadConstant(reg, slot.constant());
-      return reg;
-    }
+  if (slot.is_reg()) return slot.reg();
+  LiftoffRegister reg = GetUnusedRegister(reg_class_for(slot.type()), pinned);
+  if (slot.is_const()) {
+    LoadConstant(reg, slot.constant());
+  } else {
+    DCHECK(slot.is_stack());
+    Fill(reg, slot.offset(), slot.type());
   }
-  UNREACHABLE();
+  return reg;
 }
 
 LiftoffRegister LiftoffAssembler::LoadI64HalfIntoRegister(VarState slot,
@@ -548,23 +567,16 @@ LiftoffRegister LiftoffAssembler::LoadI64HalfIntoRegister(VarState slot,
   return dst;
 }
 
-LiftoffRegister LiftoffAssembler::PopToRegister(LiftoffRegList pinned) {
-  DCHECK(!cache_state_.stack_state.empty());
-  VarState slot = cache_state_.stack_state.back();
-  if (slot.is_reg()) cache_state_.dec_used(slot.reg());
-  cache_state_.stack_state.pop_back();
-  return LoadToRegister(slot, pinned);
-}
-
 LiftoffRegister LiftoffAssembler::PeekToRegister(int index,
                                                  LiftoffRegList pinned) {
   DCHECK_LT(index, cache_state_.stack_state.size());
   VarState& slot = cache_state_.stack_state.end()[-1 - index];
-  if (slot.is_reg()) cache_state_.dec_used(slot.reg());
-  LiftoffRegister reg = LoadToRegister(slot, pinned);
-  if (!slot.is_reg()) {
-    slot.MakeRegister(reg);
+  if (slot.is_reg()) {
+    cache_state_.dec_used(slot.reg());
+    return slot.reg();
   }
+  LiftoffRegister reg = LoadToRegister(slot, pinned);
+  slot.MakeRegister(reg);
   return reg;
 }
 
@@ -591,6 +603,28 @@ void LiftoffAssembler::PrepareLoopArgs(int num) {
     LoadConstant(reg, slot.constant());
     slot.MakeRegister(reg);
     cache_state_.inc_used(reg);
+  }
+}
+
+void LiftoffAssembler::MaterializeMergedConstants(uint32_t arity) {
+  // Materialize constants on top of the stack ({arity} many), and locals.
+  VarState* stack_base = cache_state_.stack_state.data();
+  for (auto slots :
+       {VectorOf(stack_base + cache_state_.stack_state.size() - arity, arity),
+        VectorOf(stack_base, num_locals())}) {
+    for (VarState& slot : slots) {
+      if (!slot.is_const()) continue;
+      RegClass rc = reg_class_for(slot.type());
+      if (cache_state_.has_unused_register(rc)) {
+        LiftoffRegister reg = cache_state_.unused_register(rc);
+        LoadConstant(reg, slot.constant());
+        cache_state_.inc_used(reg);
+        slot.MakeRegister(reg);
+      } else {
+        Spill(slot.offset(), slot.constant());
+        slot.MakeStack();
+      }
+    }
   }
 }
 
@@ -736,6 +770,7 @@ void LiftoffAssembler::PrepareBuiltinCall(
   LiftoffRegList param_regs;
   PrepareStackTransfers(sig, call_descriptor, params.begin(), &stack_slots,
                         &stack_transfers, &param_regs);
+  SpillAllRegisters();
   // Create all the slots.
   // Builtin stack parameters are pushed in reversed order.
   stack_slots.Reverse();
@@ -745,7 +780,6 @@ void LiftoffAssembler::PrepareBuiltinCall(
 
   // Reset register use counters.
   cache_state_.reset_used_registers();
-  SpillAllRegisters();
 }
 
 void LiftoffAssembler::PrepareCall(const FunctionSig* sig,
@@ -757,13 +791,14 @@ void LiftoffAssembler::PrepareCall(const FunctionSig* sig,
   constexpr size_t kInputShift = 1;
 
   // Spill all cache slots which are not being used as parameters.
-  // Don't update any register use counters, they will be reset later anyway.
-  for (uint32_t idx = 0, end = cache_state_.stack_height() - num_params;
-       idx < end; ++idx) {
-    VarState& slot = cache_state_.stack_state[idx];
-    if (!slot.is_reg()) continue;
-    Spill(slot.offset(), slot.reg(), slot.type());
-    slot.MakeStack();
+  for (VarState* it = cache_state_.stack_state.end() - 1 - num_params;
+       it >= cache_state_.stack_state.begin() &&
+       !cache_state_.used_registers.is_empty();
+       --it) {
+    if (!it->is_reg()) continue;
+    Spill(it->offset(), it->reg(), it->type());
+    cache_state_.dec_used(it->reg());
+    it->MakeStack();
   }
 
   LiftoffStackSlots stack_slots(this);
@@ -847,7 +882,7 @@ void LiftoffAssembler::FinishCall(const FunctionSig* sig,
       } else {
         DCHECK(loc.IsCallerFrameSlot());
         reg_pair[pair_idx] = GetUnusedRegister(rc, pinned);
-        Fill(reg_pair[pair_idx], -return_offset, lowered_type);
+        LoadReturnStackSlot(reg_pair[pair_idx], return_offset, lowered_type);
         const int type_size = lowered_type.element_size_bytes();
         const int slot_size = RoundUp<kSystemPointerSize>(type_size);
         return_offset += slot_size;
@@ -886,7 +921,7 @@ void LiftoffAssembler::Move(LiftoffRegister dst, LiftoffRegister src,
 }
 
 void LiftoffAssembler::ParallelRegisterMove(
-    Vector<ParallelRegisterMoveTuple> tuples) {
+    Vector<const ParallelRegisterMoveTuple> tuples) {
   StackTransferRecipe stack_transfers(this);
   for (auto tuple : tuples) {
     if (tuple.dst == tuple.src) continue;
@@ -896,6 +931,29 @@ void LiftoffAssembler::ParallelRegisterMove(
 
 void LiftoffAssembler::MoveToReturnLocations(
     const FunctionSig* sig, compiler::CallDescriptor* descriptor) {
+  StackTransferRecipe stack_transfers(this);
+  if (sig->return_count() == 1) {
+    ValueType return_type = sig->GetReturn(0);
+    // Defaults to a gp reg, will be set below if return type is not gp.
+    LiftoffRegister return_reg = LiftoffRegister(kGpReturnRegisters[0]);
+
+    if (needs_gp_reg_pair(return_type)) {
+      return_reg = LiftoffRegister::ForPair(kGpReturnRegisters[0],
+                                            kGpReturnRegisters[1]);
+    } else if (needs_fp_reg_pair(return_type)) {
+      return_reg = LiftoffRegister::ForFpPair(kFpReturnRegisters[0]);
+    } else if (reg_class_for(return_type) == kFpReg) {
+      return_reg = LiftoffRegister(kFpReturnRegisters[0]);
+    } else {
+      DCHECK_EQ(kGpReg, reg_class_for(return_type));
+    }
+    stack_transfers.LoadIntoRegister(return_reg,
+                                     cache_state_.stack_state.back(),
+                                     cache_state_.stack_state.back().offset());
+    return;
+  }
+
+  // Slow path for multi-return.
   int call_desc_return_idx = 0;
   DCHECK_LE(sig->return_count(), cache_state_.stack_height());
   VarState* slots = cache_state_.stack_state.end() - sig->return_count();
@@ -921,7 +979,6 @@ void LiftoffAssembler::MoveToReturnLocations(
   }
   // Prepare and execute stack transfers.
   call_desc_return_idx = 0;
-  StackTransferRecipe stack_transfers(this);
   for (size_t i = 0; i < sig->return_count(); ++i) {
     ValueType return_type = sig->GetReturn(i);
     bool needs_gp_pair = needs_gp_reg_pair(return_type);
@@ -1060,14 +1117,14 @@ void LiftoffAssembler::set_num_locals(uint32_t num_locals) {
   DCHECK_EQ(0, num_locals_);  // only call this once.
   num_locals_ = num_locals;
   if (num_locals > kInlineLocalTypes) {
-    more_local_types_ =
-        reinterpret_cast<ValueType*>(malloc(num_locals * sizeof(ValueType)));
+    more_local_types_ = reinterpret_cast<ValueType*>(
+        base::Malloc(num_locals * sizeof(ValueType)));
     DCHECK_NOT_NULL(more_local_types_);
   }
 }
 
 std::ostream& operator<<(std::ostream& os, VarState slot) {
-  os << slot.type().type_name() << ":";
+  os << slot.type().name() << ":";
   switch (slot.loc()) {
     case VarState::kStack:
       return os << "s";

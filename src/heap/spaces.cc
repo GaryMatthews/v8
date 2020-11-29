@@ -12,7 +12,6 @@
 #include "src/base/bounded-page-allocator.h"
 #include "src/base/macros.h"
 #include "src/common/globals.h"
-#include "src/heap/array-buffer-tracker-inl.h"
 #include "src/heap/combined-heap.h"
 #include "src/heap/concurrent-marking.h"
 #include "src/heap/gc-tracer.h"
@@ -22,8 +21,9 @@
 #include "src/heap/invalidated-slots-inl.h"
 #include "src/heap/large-spaces.h"
 #include "src/heap/mark-compact.h"
+#include "src/heap/memory-chunk.h"
 #include "src/heap/read-only-heap.h"
-#include "src/heap/remembered-set-inl.h"
+#include "src/heap/remembered-set.h"
 #include "src/heap/slot-set.h"
 #include "src/init/v8.h"
 #include "src/logging/counters.h"
@@ -44,21 +44,6 @@ namespace internal {
 // in order to figure out if it's a cleared weak reference or not.
 STATIC_ASSERT(kClearedWeakHeapObjectLower32 > 0);
 STATIC_ASSERT(kClearedWeakHeapObjectLower32 < Page::kHeaderSize);
-
-PauseAllocationObserversScope::PauseAllocationObserversScope(Heap* heap)
-    : heap_(heap) {
-  DCHECK_EQ(heap->gc_state(), Heap::NOT_IN_GC);
-
-  for (SpaceIterator it(heap_); it.HasNext();) {
-    it.Next()->PauseAllocationObservers();
-  }
-}
-
-PauseAllocationObserversScope::~PauseAllocationObserversScope() {
-  for (SpaceIterator it(heap_); it.HasNext();) {
-    it.Next()->ResumeAllocationObservers();
-  }
-}
 
 void Page::AllocateFreeListCategories() {
   DCHECK_NULL(categories_);
@@ -128,20 +113,6 @@ void Page::MergeOldToNewRememberedSets() {
   CHECK_NULL(slot_set_[OLD_TO_NEW]);
   slot_set_[OLD_TO_NEW] = sweeping_slot_set_;
   sweeping_slot_set_ = nullptr;
-}
-
-void Page::ResetAllocationStatistics() {
-  allocated_bytes_ = area_size();
-  wasted_memory_ = 0;
-}
-
-void Page::AllocateLocalTracker() {
-  DCHECK_NULL(local_tracker_);
-  local_tracker_ = new LocalArrayBufferTracker(this);
-}
-
-bool Page::contains_array_buffers() {
-  return local_tracker_ != nullptr && !local_tracker_->IsEmpty();
 }
 
 size_t Page::AvailableInFreeList() {
@@ -226,6 +197,19 @@ void Page::CreateBlackArea(Address start, Address end) {
   marking_state->IncrementLiveBytes(this, static_cast<intptr_t>(end - start));
 }
 
+void Page::CreateBlackAreaBackground(Address start, Address end) {
+  DCHECK(heap()->incremental_marking()->black_allocation());
+  DCHECK_EQ(Page::FromAddress(start), this);
+  DCHECK_LT(start, end);
+  DCHECK_EQ(Page::FromAddress(end - 1), this);
+  IncrementalMarking::AtomicMarkingState* marking_state =
+      heap()->incremental_marking()->atomic_marking_state();
+  marking_state->bitmap(this)->SetRange(AddressToMarkbitIndex(start),
+                                        AddressToMarkbitIndex(end));
+  heap()->incremental_marking()->IncrementLiveBytesBackground(
+      this, static_cast<intptr_t>(end - start));
+}
+
 void Page::DestroyBlackArea(Address start, Address end) {
   DCHECK(heap()->incremental_marking()->black_allocation());
   DCHECK_EQ(Page::FromAddress(start), this);
@@ -238,65 +222,33 @@ void Page::DestroyBlackArea(Address start, Address end) {
   marking_state->IncrementLiveBytes(this, -static_cast<intptr_t>(end - start));
 }
 
+void Page::DestroyBlackAreaBackground(Address start, Address end) {
+  DCHECK(heap()->incremental_marking()->black_allocation());
+  DCHECK_EQ(Page::FromAddress(start), this);
+  DCHECK_LT(start, end);
+  DCHECK_EQ(Page::FromAddress(end - 1), this);
+  IncrementalMarking::AtomicMarkingState* marking_state =
+      heap()->incremental_marking()->atomic_marking_state();
+  marking_state->bitmap(this)->ClearRange(AddressToMarkbitIndex(start),
+                                          AddressToMarkbitIndex(end));
+  heap()->incremental_marking()->IncrementLiveBytesBackground(
+      this, -static_cast<intptr_t>(end - start));
+}
+
 // -----------------------------------------------------------------------------
 // PagedSpace implementation
 
 void Space::AddAllocationObserver(AllocationObserver* observer) {
-  allocation_observers_.push_back(observer);
-  StartNextInlineAllocationStep();
+  allocation_counter_.AddAllocationObserver(observer);
 }
 
 void Space::RemoveAllocationObserver(AllocationObserver* observer) {
-  auto it = std::find(allocation_observers_.begin(),
-                      allocation_observers_.end(), observer);
-  DCHECK(allocation_observers_.end() != it);
-  allocation_observers_.erase(it);
-  StartNextInlineAllocationStep();
+  allocation_counter_.RemoveAllocationObserver(observer);
 }
 
-void Space::PauseAllocationObservers() { allocation_observers_paused_ = true; }
+void Space::PauseAllocationObservers() { allocation_counter_.Pause(); }
 
-void Space::ResumeAllocationObservers() {
-  allocation_observers_paused_ = false;
-}
-
-void Space::AllocationStep(int bytes_since_last, Address soon_object,
-                           int size) {
-  if (!AllocationObserversActive()) {
-    return;
-  }
-
-  DCHECK(!heap()->allocation_step_in_progress());
-  heap()->set_allocation_step_in_progress(true);
-  heap()->CreateFillerObjectAt(soon_object, size, ClearRecordedSlots::kNo);
-  for (AllocationObserver* observer : allocation_observers_) {
-    observer->AllocationStep(bytes_since_last, soon_object, size);
-  }
-  heap()->set_allocation_step_in_progress(false);
-}
-
-void Space::AllocationStepAfterMerge(Address first_object_in_chunk, int size) {
-  if (!AllocationObserversActive()) {
-    return;
-  }
-
-  DCHECK(!heap()->allocation_step_in_progress());
-  heap()->set_allocation_step_in_progress(true);
-  for (AllocationObserver* observer : allocation_observers_) {
-    observer->AllocationStep(size, first_object_in_chunk, size);
-  }
-  heap()->set_allocation_step_in_progress(false);
-}
-
-intptr_t Space::GetNextInlineAllocationStepSize() {
-  intptr_t next_step = 0;
-  for (AllocationObserver* observer : allocation_observers_) {
-    next_step = next_step ? Min(next_step, observer->bytes_to_next_step())
-                          : observer->bytes_to_next_step();
-  }
-  DCHECK(allocation_observers_.size() == 0 || next_step > 0);
-  return next_step;
-}
+void Space::ResumeAllocationObservers() { allocation_counter_.Resume(); }
 
 Address SpaceWithLinearArea::ComputeLimit(Address start, Address end,
                                           size_t min_size) {
@@ -305,13 +257,21 @@ Address SpaceWithLinearArea::ComputeLimit(Address start, Address end,
   if (heap()->inline_allocation_disabled()) {
     // Fit the requested area exactly.
     return start + min_size;
-  } else if (SupportsInlineAllocation() && AllocationObserversActive()) {
+  } else if (SupportsAllocationObserver() && allocation_counter_.IsActive()) {
+    // Ensure there are no unaccounted allocations.
+    DCHECK_EQ(allocation_info_.start(), allocation_info_.top());
+
     // Generated code may allocate inline from the linear allocation area for.
-    // To make sure we can observe these allocations, we use a lower limit.
-    size_t step = GetNextInlineAllocationStepSize();
+    // To make sure we can observe these allocations, we use a lower ©limit.
+    size_t step = allocation_counter_.NextBytes();
+    DCHECK_NE(step, 0);
     size_t rounded_step =
         RoundSizeDownToObjectAlignment(static_cast<int>(step - 1));
-    return Min(static_cast<Address>(start + min_size + rounded_step), end);
+    // Use uint64_t to avoid overflow on 32-bit
+    uint64_t step_end =
+        static_cast<uint64_t>(start) + std::max(min_size, rounded_step);
+    uint64_t new_end = std::min(step_end, static_cast<uint64_t>(end));
+    return static_cast<Address>(new_end);
   } else {
     // The entire node can be used as the linear allocation area.
     return end;
@@ -344,10 +304,10 @@ LinearAllocationArea LocalAllocationBuffer::CloseAndMakeIterable() {
 
 void LocalAllocationBuffer::MakeIterable() {
   if (IsValid()) {
-    heap_->CreateFillerObjectAt(
+    heap_->CreateFillerObjectAtBackground(
         allocation_info_.top(),
         static_cast<int>(allocation_info_.limit() - allocation_info_.top()),
-        ClearRecordedSlots::kNo);
+        ClearFreedMemoryMode::kDontClearFreedMemory);
   }
 }
 
@@ -356,10 +316,10 @@ LocalAllocationBuffer::LocalAllocationBuffer(
     : heap_(heap),
       allocation_info_(allocation_info) {
   if (IsValid()) {
-    heap_->CreateFillerObjectAt(
+    heap_->CreateFillerObjectAtBackground(
         allocation_info_.top(),
         static_cast<int>(allocation_info_.limit() - allocation_info_.top()),
-        ClearRecordedSlots::kNo);
+        ClearFreedMemoryMode::kDontClearFreedMemory);
   }
 }
 
@@ -376,709 +336,113 @@ LocalAllocationBuffer& LocalAllocationBuffer::operator=(
   other.allocation_info_.Reset(kNullAddress, kNullAddress);
   return *this;
 }
-void SpaceWithLinearArea::StartNextInlineAllocationStep() {
-  if (heap()->allocation_step_in_progress()) {
-    // If we are mid-way through an existing step, don't start a new one.
-    return;
-  }
-
-  if (AllocationObserversActive()) {
-    top_on_previous_step_ = top();
-    UpdateInlineAllocationLimit(0);
-  } else {
-    DCHECK_EQ(kNullAddress, top_on_previous_step_);
-  }
-}
 
 void SpaceWithLinearArea::AddAllocationObserver(AllocationObserver* observer) {
-  InlineAllocationStep(top(), top(), kNullAddress, 0);
-  Space::AddAllocationObserver(observer);
-  DCHECK_IMPLIES(top_on_previous_step_, AllocationObserversActive());
+  if (!allocation_counter_.IsStepInProgress()) {
+    AdvanceAllocationObservers();
+    Space::AddAllocationObserver(observer);
+    UpdateInlineAllocationLimit(0);
+  } else {
+    Space::AddAllocationObserver(observer);
+  }
 }
 
 void SpaceWithLinearArea::RemoveAllocationObserver(
     AllocationObserver* observer) {
-  Address top_for_next_step =
-      allocation_observers_.size() == 1 ? kNullAddress : top();
-  InlineAllocationStep(top(), top_for_next_step, kNullAddress, 0);
-  Space::RemoveAllocationObserver(observer);
-  DCHECK_IMPLIES(top_on_previous_step_, AllocationObserversActive());
+  if (!allocation_counter_.IsStepInProgress()) {
+    AdvanceAllocationObservers();
+    Space::RemoveAllocationObserver(observer);
+    UpdateInlineAllocationLimit(0);
+  } else {
+    Space::RemoveAllocationObserver(observer);
+  }
 }
 
 void SpaceWithLinearArea::PauseAllocationObservers() {
-  // Do a step to account for memory allocated so far.
-  InlineAllocationStep(top(), kNullAddress, kNullAddress, 0);
+  AdvanceAllocationObservers();
   Space::PauseAllocationObservers();
-  DCHECK_EQ(kNullAddress, top_on_previous_step_);
-  UpdateInlineAllocationLimit(0);
 }
 
 void SpaceWithLinearArea::ResumeAllocationObservers() {
-  DCHECK_EQ(kNullAddress, top_on_previous_step_);
   Space::ResumeAllocationObservers();
-  StartNextInlineAllocationStep();
+  MarkLabStartInitialized();
+  UpdateInlineAllocationLimit(0);
 }
 
-void SpaceWithLinearArea::InlineAllocationStep(Address top,
-                                               Address top_for_next_step,
-                                               Address soon_object,
-                                               size_t size) {
-  if (heap()->allocation_step_in_progress()) {
-    // Avoid starting a new step if we are mid-way through an existing one.
-    return;
-  }
-
-  if (top_on_previous_step_) {
-    if (top < top_on_previous_step_) {
-      // Generated code decreased the top pointer to do folded allocations.
-      DCHECK_NE(top, kNullAddress);
-      DCHECK_EQ(Page::FromAllocationAreaAddress(top),
-                Page::FromAllocationAreaAddress(top_on_previous_step_));
-      top_on_previous_step_ = top;
-    }
-    int bytes_allocated = static_cast<int>(top - top_on_previous_step_);
-    AllocationStep(bytes_allocated, soon_object, static_cast<int>(size));
-    top_on_previous_step_ = top_for_next_step;
+void SpaceWithLinearArea::AdvanceAllocationObservers() {
+  if (allocation_info_.top() &&
+      allocation_info_.start() != allocation_info_.top()) {
+    allocation_counter_.AdvanceAllocationObservers(allocation_info_.top() -
+                                                   allocation_info_.start());
+    MarkLabStartInitialized();
   }
 }
 
-// -----------------------------------------------------------------------------
-// Free lists for old object spaces implementation
+void SpaceWithLinearArea::MarkLabStartInitialized() {
+  allocation_info_.MoveStartToTop();
+  if (identity() == NEW_SPACE) {
+    heap()->new_space()->MoveOriginalTopForward();
 
-void FreeListCategory::Reset(FreeList* owner) {
-  if (is_linked(owner) && !top().is_null()) {
-    owner->DecreaseAvailableBytes(available_);
-  }
-  set_top(FreeSpace());
-  set_prev(nullptr);
-  set_next(nullptr);
-  available_ = 0;
-}
-
-FreeSpace FreeListCategory::PickNodeFromList(size_t minimum_size,
-                                             size_t* node_size) {
-  FreeSpace node = top();
-  DCHECK(!node.is_null());
-  DCHECK(Page::FromHeapObject(node)->CanAllocate());
-  if (static_cast<size_t>(node.Size()) < minimum_size) {
-    *node_size = 0;
-    return FreeSpace();
-  }
-  set_top(node.next());
-  *node_size = node.Size();
-  UpdateCountersAfterAllocation(*node_size);
-  return node;
-}
-
-FreeSpace FreeListCategory::SearchForNodeInList(size_t minimum_size,
-                                                size_t* node_size) {
-  FreeSpace prev_non_evac_node;
-  for (FreeSpace cur_node = top(); !cur_node.is_null();
-       cur_node = cur_node.next()) {
-    DCHECK(Page::FromHeapObject(cur_node)->CanAllocate());
-    size_t size = cur_node.size();
-    if (size >= minimum_size) {
-      DCHECK_GE(available_, size);
-      UpdateCountersAfterAllocation(size);
-      if (cur_node == top()) {
-        set_top(cur_node.next());
-      }
-      if (!prev_non_evac_node.is_null()) {
-        MemoryChunk* chunk = MemoryChunk::FromHeapObject(prev_non_evac_node);
-        if (chunk->owner_identity() == CODE_SPACE) {
-          chunk->heap()->UnprotectAndRegisterMemoryChunk(chunk);
-        }
-        prev_non_evac_node.set_next(cur_node.next());
-      }
-      *node_size = size;
-      return cur_node;
-    }
-
-    prev_non_evac_node = cur_node;
-  }
-  return FreeSpace();
-}
-
-void FreeListCategory::Free(Address start, size_t size_in_bytes, FreeMode mode,
-                            FreeList* owner) {
-  FreeSpace free_space = FreeSpace::cast(HeapObject::FromAddress(start));
-  free_space.set_next(top());
-  set_top(free_space);
-  available_ += size_in_bytes;
-  if (mode == kLinkCategory) {
-    if (is_linked(owner)) {
-      owner->IncreaseAvailableBytes(size_in_bytes);
-    } else {
-      owner->AddCategory(this);
-    }
-  }
-}
-
-void FreeListCategory::RepairFreeList(Heap* heap) {
-  Map free_space_map = ReadOnlyRoots(heap).free_space_map();
-  FreeSpace n = top();
-  while (!n.is_null()) {
-    ObjectSlot map_slot = n.map_slot();
-    if (map_slot.contains_value(kNullAddress)) {
-      map_slot.store(free_space_map);
-    } else {
-      DCHECK(map_slot.contains_value(free_space_map.ptr()));
-    }
-    n = n.next();
-  }
-}
-
-void FreeListCategory::Relink(FreeList* owner) {
-  DCHECK(!is_linked(owner));
-  owner->AddCategory(this);
-}
-
-// ------------------------------------------------
-// Generic FreeList methods (alloc/free related)
-
-FreeList* FreeList::CreateFreeList() {
-  switch (FLAG_gc_freelist_strategy) {
-    case 0:
-      return new FreeListLegacy();
-    case 1:
-      return new FreeListFastAlloc();
-    case 2:
-      return new FreeListMany();
-    case 3:
-      return new FreeListManyCached();
-    case 4:
-      return new FreeListManyCachedFastPath();
-    case 5:
-      return new FreeListManyCachedOrigin();
-    default:
-      FATAL("Invalid FreeList strategy");
-  }
-}
-
-FreeSpace FreeList::TryFindNodeIn(FreeListCategoryType type,
-                                  size_t minimum_size, size_t* node_size) {
-  FreeListCategory* category = categories_[type];
-  if (category == nullptr) return FreeSpace();
-  FreeSpace node = category->PickNodeFromList(minimum_size, node_size);
-  if (!node.is_null()) {
-    DecreaseAvailableBytes(*node_size);
-    DCHECK(IsVeryLong() || Available() == SumFreeLists());
-  }
-  if (category->is_empty()) {
-    RemoveCategory(category);
-  }
-  return node;
-}
-
-FreeSpace FreeList::SearchForNodeInList(FreeListCategoryType type,
-                                        size_t minimum_size,
-                                        size_t* node_size) {
-  FreeListCategoryIterator it(this, type);
-  FreeSpace node;
-  while (it.HasNext()) {
-    FreeListCategory* current = it.Next();
-    node = current->SearchForNodeInList(minimum_size, node_size);
-    if (!node.is_null()) {
-      DecreaseAvailableBytes(*node_size);
-      DCHECK(IsVeryLong() || Available() == SumFreeLists());
-      if (current->is_empty()) {
-        RemoveCategory(current);
-      }
-      return node;
-    }
-  }
-  return node;
-}
-
-size_t FreeList::Free(Address start, size_t size_in_bytes, FreeMode mode) {
-  Page* page = Page::FromAddress(start);
-  page->DecreaseAllocatedBytes(size_in_bytes);
-
-  // Blocks have to be a minimum size to hold free list items.
-  if (size_in_bytes < min_block_size_) {
-    page->add_wasted_memory(size_in_bytes);
-    wasted_bytes_ += size_in_bytes;
-    return size_in_bytes;
-  }
-
-  // Insert other blocks at the head of a free list of the appropriate
-  // magnitude.
-  FreeListCategoryType type = SelectFreeListCategoryType(size_in_bytes);
-  page->free_list_category(type)->Free(start, size_in_bytes, mode, this);
-  DCHECK_EQ(page->AvailableInFreeList(),
-            page->AvailableInFreeListFromAllocatedBytes());
-  return 0;
-}
-
-// ------------------------------------------------
-// FreeListLegacy implementation
-
-FreeListLegacy::FreeListLegacy() {
-  // Initializing base (FreeList) fields
-  number_of_categories_ = kHuge + 1;
-  last_category_ = kHuge;
-  min_block_size_ = kMinBlockSize;
-  categories_ = new FreeListCategory*[number_of_categories_]();
-
-  Reset();
-}
-
-FreeListLegacy::~FreeListLegacy() { delete[] categories_; }
-
-FreeSpace FreeListLegacy::Allocate(size_t size_in_bytes, size_t* node_size,
-                                   AllocationOrigin origin) {
-  DCHECK_GE(kMaxBlockSize, size_in_bytes);
-  FreeSpace node;
-  // First try the allocation fast path: try to allocate the minimum element
-  // size of a free list category. This operation is constant time.
-  FreeListCategoryType type =
-      SelectFastAllocationFreeListCategoryType(size_in_bytes);
-  for (int i = type; i < kHuge && node.is_null(); i++) {
-    node = TryFindNodeIn(static_cast<FreeListCategoryType>(i), size_in_bytes,
-                         node_size);
-  }
-
-  if (node.is_null()) {
-    // Next search the huge list for free list nodes. This takes linear time in
-    // the number of huge elements.
-    node = SearchForNodeInList(kHuge, size_in_bytes, node_size);
-  }
-
-  if (node.is_null() && type != kHuge) {
-    // We didn't find anything in the huge list.
-    type = SelectFreeListCategoryType(size_in_bytes);
-
-    if (type == kTiniest) {
-      // For this tiniest object, the tiny list hasn't been searched yet.
-      // Now searching the tiny list.
-      node = TryFindNodeIn(kTiny, size_in_bytes, node_size);
-    }
-
-    if (node.is_null()) {
-      // Now search the best fitting free list for a node that has at least the
-      // requested size.
-      node = TryFindNodeIn(type, size_in_bytes, node_size);
-    }
-  }
-
-  if (!node.is_null()) {
-    Page::FromHeapObject(node)->IncreaseAllocatedBytes(*node_size);
-  }
-
-  DCHECK(IsVeryLong() || Available() == SumFreeLists());
-  return node;
-}
-
-// ------------------------------------------------
-// FreeListFastAlloc implementation
-
-FreeListFastAlloc::FreeListFastAlloc() {
-  // Initializing base (FreeList) fields
-  number_of_categories_ = kHuge + 1;
-  last_category_ = kHuge;
-  min_block_size_ = kMinBlockSize;
-  categories_ = new FreeListCategory*[number_of_categories_]();
-
-  Reset();
-}
-
-FreeListFastAlloc::~FreeListFastAlloc() { delete[] categories_; }
-
-FreeSpace FreeListFastAlloc::Allocate(size_t size_in_bytes, size_t* node_size,
-                                      AllocationOrigin origin) {
-  DCHECK_GE(kMaxBlockSize, size_in_bytes);
-  FreeSpace node;
-  // Try to allocate the biggest element possible (to make the most of later
-  // bump-pointer allocations).
-  FreeListCategoryType type = SelectFreeListCategoryType(size_in_bytes);
-  for (int i = kHuge; i >= type && node.is_null(); i--) {
-    node = TryFindNodeIn(static_cast<FreeListCategoryType>(i), size_in_bytes,
-                         node_size);
-  }
-
-  if (!node.is_null()) {
-    Page::FromHeapObject(node)->IncreaseAllocatedBytes(*node_size);
-  }
-
-  DCHECK(IsVeryLong() || Available() == SumFreeLists());
-  return node;
-}
-
-// ------------------------------------------------
-// FreeListMany implementation
-
-constexpr unsigned int FreeListMany::categories_min[kNumberOfCategories];
-
-FreeListMany::FreeListMany() {
-  // Initializing base (FreeList) fields
-  number_of_categories_ = kNumberOfCategories;
-  last_category_ = number_of_categories_ - 1;
-  min_block_size_ = kMinBlockSize;
-  categories_ = new FreeListCategory*[number_of_categories_]();
-
-  Reset();
-}
-
-FreeListMany::~FreeListMany() { delete[] categories_; }
-
-size_t FreeListMany::GuaranteedAllocatable(size_t maximum_freed) {
-  if (maximum_freed < categories_min[0]) {
-    return 0;
-  }
-  for (int cat = kFirstCategory + 1; cat <= last_category_; cat++) {
-    if (maximum_freed < categories_min[cat]) {
-      return categories_min[cat - 1];
-    }
-  }
-  return maximum_freed;
-}
-
-Page* FreeListMany::GetPageForSize(size_t size_in_bytes) {
-  FreeListCategoryType minimum_category =
-      SelectFreeListCategoryType(size_in_bytes);
-  Page* page = nullptr;
-  for (int cat = minimum_category + 1; !page && cat <= last_category_; cat++) {
-    page = GetPageForCategoryType(cat);
-  }
-  if (!page) {
-    // Might return a page in which |size_in_bytes| will not fit.
-    page = GetPageForCategoryType(minimum_category);
-  }
-  return page;
-}
-
-FreeSpace FreeListMany::Allocate(size_t size_in_bytes, size_t* node_size,
-                                 AllocationOrigin origin) {
-  DCHECK_GE(kMaxBlockSize, size_in_bytes);
-  FreeSpace node;
-  FreeListCategoryType type = SelectFreeListCategoryType(size_in_bytes);
-  for (int i = type; i < last_category_ && node.is_null(); i++) {
-    node = TryFindNodeIn(static_cast<FreeListCategoryType>(i), size_in_bytes,
-                         node_size);
-  }
-
-  if (node.is_null()) {
-    // Searching each element of the last category.
-    node = SearchForNodeInList(last_category_, size_in_bytes, node_size);
-  }
-
-  if (!node.is_null()) {
-    Page::FromHeapObject(node)->IncreaseAllocatedBytes(*node_size);
-  }
-
-  DCHECK(IsVeryLong() || Available() == SumFreeLists());
-  return node;
-}
-
-// ------------------------------------------------
-// FreeListManyCached implementation
-
-FreeListManyCached::FreeListManyCached() { ResetCache(); }
-
-void FreeListManyCached::Reset() {
-  ResetCache();
-  FreeListMany::Reset();
-}
-
-bool FreeListManyCached::AddCategory(FreeListCategory* category) {
-  bool was_added = FreeList::AddCategory(category);
-
-  // Updating cache
-  if (was_added) {
-    UpdateCacheAfterAddition(category->type_);
-  }
-
-#ifdef DEBUG
-  CheckCacheIntegrity();
-#endif
-
-  return was_added;
-}
-
-void FreeListManyCached::RemoveCategory(FreeListCategory* category) {
-  FreeList::RemoveCategory(category);
-
-  // Updating cache
-  int type = category->type_;
-  if (categories_[type] == nullptr) {
-    UpdateCacheAfterRemoval(type);
-  }
-
-#ifdef DEBUG
-  CheckCacheIntegrity();
-#endif
-}
-
-size_t FreeListManyCached::Free(Address start, size_t size_in_bytes,
-                                FreeMode mode) {
-  Page* page = Page::FromAddress(start);
-  page->DecreaseAllocatedBytes(size_in_bytes);
-
-  // Blocks have to be a minimum size to hold free list items.
-  if (size_in_bytes < min_block_size_) {
-    page->add_wasted_memory(size_in_bytes);
-    wasted_bytes_ += size_in_bytes;
-    return size_in_bytes;
-  }
-
-  // Insert other blocks at the head of a free list of the appropriate
-  // magnitude.
-  FreeListCategoryType type = SelectFreeListCategoryType(size_in_bytes);
-  page->free_list_category(type)->Free(start, size_in_bytes, mode, this);
-
-  // Updating cache
-  if (mode == kLinkCategory) {
-    UpdateCacheAfterAddition(type);
-
-#ifdef DEBUG
-    CheckCacheIntegrity();
+#if DEBUG
+    heap()->VerifyNewSpaceTop();
 #endif
   }
-
-  DCHECK_EQ(page->AvailableInFreeList(),
-            page->AvailableInFreeListFromAllocatedBytes());
-  return 0;
 }
 
-FreeSpace FreeListManyCached::Allocate(size_t size_in_bytes, size_t* node_size,
-                                       AllocationOrigin origin) {
-  USE(origin);
-  DCHECK_GE(kMaxBlockSize, size_in_bytes);
+// Perform an allocation step when the step is reached. size_in_bytes is the
+// actual size needed for the object (required for InvokeAllocationObservers).
+// aligned_size_in_bytes is the size of the object including the filler right
+// before it to reach the right alignment (required to DCHECK the start of the
+// object). allocation_size is the size of the actual allocation which needs to
+// be used for the accounting. It can be different from aligned_size_in_bytes in
+// PagedSpace::AllocateRawAligned, where we have to overallocate in order to be
+// able to align the allocation afterwards.
+void SpaceWithLinearArea::InvokeAllocationObservers(
+    Address soon_object, size_t size_in_bytes, size_t aligned_size_in_bytes,
+    size_t allocation_size) {
+  DCHECK_LE(size_in_bytes, aligned_size_in_bytes);
+  DCHECK_LE(aligned_size_in_bytes, allocation_size);
+  DCHECK(size_in_bytes == aligned_size_in_bytes ||
+         aligned_size_in_bytes == allocation_size);
 
-  FreeSpace node;
-  FreeListCategoryType type = SelectFreeListCategoryType(size_in_bytes);
-  type = next_nonempty_category[type];
-  for (; type < last_category_; type = next_nonempty_category[type + 1]) {
-    node = TryFindNodeIn(type, size_in_bytes, node_size);
-    if (!node.is_null()) break;
-  }
+  if (!SupportsAllocationObserver() || !allocation_counter_.IsActive()) return;
 
-  if (node.is_null()) {
-    // Searching each element of the last category.
-    type = last_category_;
-    node = SearchForNodeInList(type, size_in_bytes, node_size);
-  }
+  if (allocation_size >= allocation_counter_.NextBytes()) {
+    // Only the first object in a LAB should reach the next step.
+    DCHECK_EQ(soon_object,
+              allocation_info_.start() + aligned_size_in_bytes - size_in_bytes);
 
-  // Updating cache
-  if (!node.is_null() && categories_[type] == nullptr) {
-    UpdateCacheAfterRemoval(type);
-  }
+    // Right now the LAB only contains that one object.
+    DCHECK_EQ(allocation_info_.top() + allocation_size - aligned_size_in_bytes,
+              allocation_info_.limit());
 
-#ifdef DEBUG
-  CheckCacheIntegrity();
+    // Ensure that there is a valid object
+    if (identity() == CODE_SPACE) {
+      MemoryChunk* chunk = MemoryChunk::FromAddress(soon_object);
+      heap()->UnprotectAndRegisterMemoryChunk(chunk);
+    }
+    heap_->CreateFillerObjectAt(soon_object, static_cast<int>(size_in_bytes),
+                                ClearRecordedSlots::kNo);
+
+#if DEBUG
+    // Ensure that allocation_info_ isn't modified during one of the
+    // AllocationObserver::Step methods.
+    LinearAllocationArea saved_allocation_info = allocation_info_;
 #endif
 
-  if (!node.is_null()) {
-    Page::FromHeapObject(node)->IncreaseAllocatedBytes(*node_size);
+    // Run AllocationObserver::Step through the AllocationCounter.
+    allocation_counter_.InvokeAllocationObservers(soon_object, size_in_bytes,
+                                                  allocation_size);
+
+    // Ensure that start/top/limit didn't change.
+    DCHECK_EQ(saved_allocation_info.start(), allocation_info_.start());
+    DCHECK_EQ(saved_allocation_info.top(), allocation_info_.top());
+    DCHECK_EQ(saved_allocation_info.limit(), allocation_info_.limit());
   }
 
-  DCHECK(IsVeryLong() || Available() == SumFreeLists());
-  return node;
-}
-
-// ------------------------------------------------
-// FreeListManyCachedFastPath implementation
-
-FreeSpace FreeListManyCachedFastPath::Allocate(size_t size_in_bytes,
-                                               size_t* node_size,
-                                               AllocationOrigin origin) {
-  USE(origin);
-  DCHECK_GE(kMaxBlockSize, size_in_bytes);
-  FreeSpace node;
-
-  // Fast path part 1: searching the last categories
-  FreeListCategoryType first_category =
-      SelectFastAllocationFreeListCategoryType(size_in_bytes);
-  FreeListCategoryType type = first_category;
-  for (type = next_nonempty_category[type]; type <= last_category_;
-       type = next_nonempty_category[type + 1]) {
-    node = TryFindNodeIn(type, size_in_bytes, node_size);
-    if (!node.is_null()) break;
-  }
-
-  // Fast path part 2: searching the medium categories for tiny objects
-  if (node.is_null()) {
-    if (size_in_bytes <= kTinyObjectMaxSize) {
-      for (type = next_nonempty_category[kFastPathFallBackTiny];
-           type < kFastPathFirstCategory;
-           type = next_nonempty_category[type + 1]) {
-        node = TryFindNodeIn(type, size_in_bytes, node_size);
-        if (!node.is_null()) break;
-      }
-    }
-  }
-
-  // Searching the last category
-  if (node.is_null()) {
-    // Searching each element of the last category.
-    type = last_category_;
-    node = SearchForNodeInList(type, size_in_bytes, node_size);
-  }
-
-  // Finally, search the most precise category
-  if (node.is_null()) {
-    type = SelectFreeListCategoryType(size_in_bytes);
-    for (type = next_nonempty_category[type]; type < first_category;
-         type = next_nonempty_category[type + 1]) {
-      node = TryFindNodeIn(type, size_in_bytes, node_size);
-      if (!node.is_null()) break;
-    }
-  }
-
-  // Updating cache
-  if (!node.is_null() && categories_[type] == nullptr) {
-    UpdateCacheAfterRemoval(type);
-  }
-
-#ifdef DEBUG
-  CheckCacheIntegrity();
-#endif
-
-  if (!node.is_null()) {
-    Page::FromHeapObject(node)->IncreaseAllocatedBytes(*node_size);
-  }
-
-  DCHECK(IsVeryLong() || Available() == SumFreeLists());
-  return node;
-}
-
-// ------------------------------------------------
-// FreeListManyCachedOrigin implementation
-
-FreeSpace FreeListManyCachedOrigin::Allocate(size_t size_in_bytes,
-                                             size_t* node_size,
-                                             AllocationOrigin origin) {
-  if (origin == AllocationOrigin::kGC) {
-    return FreeListManyCached::Allocate(size_in_bytes, node_size, origin);
-  } else {
-    return FreeListManyCachedFastPath::Allocate(size_in_bytes, node_size,
-                                                origin);
-  }
-}
-
-// ------------------------------------------------
-// FreeListMap implementation
-
-FreeListMap::FreeListMap() {
-  // Initializing base (FreeList) fields
-  number_of_categories_ = 1;
-  last_category_ = kOnlyCategory;
-  min_block_size_ = kMinBlockSize;
-  categories_ = new FreeListCategory*[number_of_categories_]();
-
-  Reset();
-}
-
-size_t FreeListMap::GuaranteedAllocatable(size_t maximum_freed) {
-  return maximum_freed;
-}
-
-Page* FreeListMap::GetPageForSize(size_t size_in_bytes) {
-  return GetPageForCategoryType(kOnlyCategory);
-}
-
-FreeListMap::~FreeListMap() { delete[] categories_; }
-
-FreeSpace FreeListMap::Allocate(size_t size_in_bytes, size_t* node_size,
-                                AllocationOrigin origin) {
-  DCHECK_GE(kMaxBlockSize, size_in_bytes);
-
-  // The following DCHECK ensures that maps are allocated one by one (ie,
-  // without folding). This assumption currently holds. However, if it were to
-  // become untrue in the future, you'll get an error here. To fix it, I would
-  // suggest removing the DCHECK, and replacing TryFindNodeIn by
-  // SearchForNodeInList below.
-  DCHECK_EQ(size_in_bytes, Map::kSize);
-
-  FreeSpace node = TryFindNodeIn(kOnlyCategory, size_in_bytes, node_size);
-
-  if (!node.is_null()) {
-    Page::FromHeapObject(node)->IncreaseAllocatedBytes(*node_size);
-  }
-
-  DCHECK_IMPLIES(node.is_null(), IsEmpty());
-  return node;
-}
-
-// ------------------------------------------------
-// Generic FreeList methods (non alloc/free related)
-
-void FreeList::Reset() {
-  ForAllFreeListCategories(
-      [this](FreeListCategory* category) { category->Reset(this); });
-  for (int i = kFirstCategory; i < number_of_categories_; i++) {
-    categories_[i] = nullptr;
-  }
-  wasted_bytes_ = 0;
-  available_ = 0;
-}
-
-size_t FreeList::EvictFreeListItems(Page* page) {
-  size_t sum = 0;
-  page->ForAllFreeListCategories([this, &sum](FreeListCategory* category) {
-    sum += category->available();
-    RemoveCategory(category);
-    category->Reset(this);
-  });
-  return sum;
-}
-
-void FreeList::RepairLists(Heap* heap) {
-  ForAllFreeListCategories(
-      [heap](FreeListCategory* category) { category->RepairFreeList(heap); });
-}
-
-bool FreeList::AddCategory(FreeListCategory* category) {
-  FreeListCategoryType type = category->type_;
-  DCHECK_LT(type, number_of_categories_);
-  FreeListCategory* top = categories_[type];
-
-  if (category->is_empty()) return false;
-  DCHECK_NE(top, category);
-
-  // Common double-linked list insertion.
-  if (top != nullptr) {
-    top->set_prev(category);
-  }
-  category->set_next(top);
-  categories_[type] = category;
-
-  IncreaseAvailableBytes(category->available());
-  return true;
-}
-
-void FreeList::RemoveCategory(FreeListCategory* category) {
-  FreeListCategoryType type = category->type_;
-  DCHECK_LT(type, number_of_categories_);
-  FreeListCategory* top = categories_[type];
-
-  if (category->is_linked(this)) {
-    DecreaseAvailableBytes(category->available());
-  }
-
-  // Common double-linked list removal.
-  if (top == category) {
-    categories_[type] = category->next();
-  }
-  if (category->prev() != nullptr) {
-    category->prev()->set_next(category->next());
-  }
-  if (category->next() != nullptr) {
-    category->next()->set_prev(category->prev());
-  }
-  category->set_next(nullptr);
-  category->set_prev(nullptr);
-}
-
-void FreeList::PrintCategories(FreeListCategoryType type) {
-  FreeListCategoryIterator it(this, type);
-  PrintF("FreeList[%p, top=%p, %d] ", static_cast<void*>(this),
-         static_cast<void*>(categories_[type]), type);
-  while (it.HasNext()) {
-    FreeListCategory* current = it.Next();
-    PrintF("%p -> ", static_cast<void*>(current));
-  }
-  PrintF("null\n");
+  DCHECK_IMPLIES(allocation_counter_.IsActive(),
+                 (allocation_info_.limit() - allocation_info_.start()) <
+                     allocation_counter_.NextBytes());
 }
 
 int MemoryChunk::FreeListsLength() {
@@ -1091,57 +455,6 @@ int MemoryChunk::FreeListsLength() {
   }
   return length;
 }
-
-size_t FreeListCategory::SumFreeList() {
-  size_t sum = 0;
-  FreeSpace cur = top();
-  while (!cur.is_null()) {
-    // We can't use "cur->map()" here because both cur's map and the
-    // root can be null during bootstrapping.
-    DCHECK(cur.map_slot().contains_value(Page::FromHeapObject(cur)
-                                             ->heap()
-                                             ->isolate()
-                                             ->root(RootIndex::kFreeSpaceMap)
-                                             .ptr()));
-    sum += cur.relaxed_read_size();
-    cur = cur.next();
-  }
-  return sum;
-}
-int FreeListCategory::FreeListLength() {
-  int length = 0;
-  FreeSpace cur = top();
-  while (!cur.is_null()) {
-    length++;
-    cur = cur.next();
-  }
-  return length;
-}
-
-#ifdef DEBUG
-bool FreeList::IsVeryLong() {
-  int len = 0;
-  for (int i = kFirstCategory; i < number_of_categories_; i++) {
-    FreeListCategoryIterator it(this, static_cast<FreeListCategoryType>(i));
-    while (it.HasNext()) {
-      len += it.Next()->FreeListLength();
-      if (len >= FreeListCategory::kVeryLongFreeList) return true;
-    }
-  }
-  return false;
-}
-
-
-// This can take a very long time because it is linear in the number of entries
-// on the free list, so it should not be called if FreeListLength returns
-// kVeryLongFreeList.
-size_t FreeList::SumFreeLists() {
-  size_t sum = 0;
-  ForAllFreeListCategories(
-      [&sum](FreeListCategory* category) { sum += category->SumFreeList(); });
-  return sum;
-}
-#endif
 
 }  // namespace internal
 }  // namespace v8

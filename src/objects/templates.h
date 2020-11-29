@@ -6,13 +6,15 @@
 #define V8_OBJECTS_TEMPLATES_H_
 
 #include "src/objects/struct.h"
-#include "torque-generated/bit-fields-tq.h"
+#include "torque-generated/bit-fields.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
 namespace v8 {
 namespace internal {
+
+#include "torque-generated/src/objects/templates-tq.inc"
 
 class TemplateInfo : public TorqueGeneratedTemplateInfo<TemplateInfo, Struct> {
  public:
@@ -85,6 +87,8 @@ class FunctionTemplateInfo
   DECL_RARE_ACCESSORS(c_signature, CSignature, Object)
 #undef DECL_RARE_ACCESSORS
 
+  DECL_RELEASE_ACQUIRE_ACCESSORS(call_code, HeapObject)
+
   // Begin flag bits ---------------------
   DECL_BOOLEAN_ACCESSORS(undetectable)
 
@@ -117,12 +121,13 @@ class FunctionTemplateInfo
       MaybeHandle<Name> maybe_name);
 
   static Handle<SharedFunctionInfo> GetOrCreateSharedFunctionInfo(
-      OffThreadIsolate* isolate, Handle<FunctionTemplateInfo> info,
+      LocalIsolate* isolate, Handle<FunctionTemplateInfo> info,
       Handle<Name> maybe_name) {
     // We don't support streaming compilation of scripts with natives, so we
     // don't need an off-thread implementation of this.
     UNREACHABLE();
   }
+
   // Returns parent function template or a null FunctionTemplateInfo.
   inline FunctionTemplateInfo GetParent(Isolate* isolate);
   // Returns true if |object| is an instance of this function template.
@@ -155,6 +160,7 @@ class ObjectTemplateInfo
  public:
   DECL_INT_ACCESSORS(embedder_field_count)
   DECL_BOOLEAN_ACCESSORS(immutable_proto)
+  DECL_BOOLEAN_ACCESSORS(code_like)
 
   // Dispatched behavior.
   DECL_PRINTER(ObjectTemplateInfo)

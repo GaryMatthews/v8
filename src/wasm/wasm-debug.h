@@ -34,6 +34,7 @@ class NativeModule;
 class WasmCode;
 class WireBytesRef;
 class WasmValue;
+struct WasmFunction;
 
 // Side table storing information used to inspect Liftoff frames at runtime.
 // This table is only created on demand for debugging, so it is not optimized
@@ -149,11 +150,14 @@ class V8_EXPORT_PRIVATE DebugInfo {
   // For the frame inspection methods below:
   // {fp} is the frame pointer of the Liftoff frame, {debug_break_fp} that of
   // the {WasmDebugBreak} frame (if any).
-  int GetNumLocals(Isolate*, Address pc);
-  WasmValue GetLocalValue(int local, Isolate*, Address pc, Address fp,
+  int GetNumLocals(Address pc);
+  WasmValue GetLocalValue(int local, Address pc, Address fp,
                           Address debug_break_fp);
-  int GetStackDepth(Isolate*, Address pc);
-  WasmValue GetStackValue(int index, Isolate*, Address pc, Address fp,
+  int GetStackDepth(Address pc);
+
+  const wasm::WasmFunction& GetFunctionAtAddress(Address pc);
+
+  WasmValue GetStackValue(int index, Address pc, Address fp,
                           Address debug_break_fp);
 
   Handle<JSObject> GetLocalScopeObject(Isolate*, Address pc, Address fp,
@@ -166,9 +170,13 @@ class V8_EXPORT_PRIVATE DebugInfo {
 
   void SetBreakpoint(int func_index, int offset, Isolate* current_isolate);
 
-  void PrepareStep(Isolate*, StackFrameId);
+  // Returns true if we stay inside the passed frame (or a called frame) after
+  // the step. False if the frame will return after the step.
+  bool PrepareStep(WasmFrame*);
 
-  void ClearStepping();
+  void PrepareStepOutTo(WasmFrame*);
+
+  void ClearStepping(Isolate*);
 
   bool IsStepping(WasmFrame*);
 
@@ -179,6 +187,8 @@ class V8_EXPORT_PRIVATE DebugInfo {
   // Return the debug side table for the given code object, but only if it has
   // already been created. This will never trigger generation of the table.
   DebugSideTable* GetDebugSideTableIfExists(const WasmCode*) const;
+
+  void RemoveIsolate(Isolate*);
 
  private:
   std::unique_ptr<DebugInfoImpl> impl_;

@@ -8,6 +8,7 @@
 #include "src/builtins/builtins.h"
 #include "src/codegen/constants-arch.h"
 #include "src/codegen/external-reference-table.h"
+#include "src/execution/external-pointer-table.h"
 #include "src/execution/stack-guard.h"
 #include "src/execution/thread-local-top.h"
 #include "src/roots/roots.h"
@@ -56,6 +57,10 @@ class IsolateData final {
   static constexpr int builtin_entry_table_offset() {
     return kBuiltinEntryTableOffset - kIsolateRootBias;
   }
+  static constexpr int builtin_entry_slot_offset(Builtins::Name builtin_index) {
+    CONSTEXPR_DCHECK(Builtins::IsBuiltinId(builtin_index));
+    return builtin_entry_table_offset() + builtin_index * kSystemPointerSize;
+  }
 
   // Root-register-relative offset of the builtins table.
   static constexpr int builtins_table_offset() {
@@ -68,6 +73,10 @@ class IsolateData final {
 
   static constexpr int fast_c_call_caller_pc_offset() {
     return kFastCCallCallerPCOffset - kIsolateRootBias;
+  }
+
+  static constexpr int fast_api_call_target_offset() {
+    return kFastApiCallTargetOffset - kIsolateRootBias;
   }
 
   // Root-register-relative offset of the given builtin table entry.
@@ -85,10 +94,14 @@ class IsolateData final {
   // The FP and PC that are saved right before TurboAssembler::CallCFunction.
   Address* fast_c_call_caller_fp_address() { return &fast_c_call_caller_fp_; }
   Address* fast_c_call_caller_pc_address() { return &fast_c_call_caller_pc_; }
+  // The address of the fast API callback right before it's executed from
+  // generated code.
+  Address* fast_api_call_target_address() { return &fast_api_call_target_; }
   StackGuard* stack_guard() { return &stack_guard_; }
   uint8_t* stack_is_iterable_address() { return &stack_is_iterable_; }
   Address fast_c_call_caller_fp() { return fast_c_call_caller_fp_; }
   Address fast_c_call_caller_pc() { return fast_c_call_caller_pc_; }
+  Address fast_api_call_target() { return fast_api_call_target_; }
   uint8_t stack_is_iterable() { return stack_is_iterable_; }
 
   // Returns true if this address points to data stored in this instance.
@@ -123,23 +136,29 @@ class IsolateData final {
   // beginning of IsolateData.
 #define FIELDS(V)                                                             \
   V(kEmbedderDataOffset, Internals::kNumIsolateDataSlots* kSystemPointerSize) \
-  V(kExternalMemoryOffset, kInt64Size)                                        \
-  V(kExternalMemoryLlimitOffset, kInt64Size)                                  \
-  V(kExternalMemoryLowSinceMarkCompactOffset, kInt64Size)                     \
   V(kFastCCallCallerFPOffset, kSystemPointerSize)                             \
   V(kFastCCallCallerPCOffset, kSystemPointerSize)                             \
+  V(kFastApiCallTargetOffset, kSystemPointerSize)                             \
   V(kStackGuardOffset, StackGuard::kSizeInBytes)                              \
   V(kRootsTableOffset, RootsTable::kEntriesCount* kSystemPointerSize)         \
   V(kExternalReferenceTableOffset, ExternalReferenceTable::kSizeInBytes)      \
   V(kThreadLocalTopOffset, ThreadLocalTop::kSizeInBytes)                      \
   V(kBuiltinEntryTableOffset, Builtins::builtin_count* kSystemPointerSize)    \
   V(kBuiltinsTableOffset, Builtins::builtin_count* kSystemPointerSize)        \
+  FIELDS_HEAP_SANDBOX(V)                                                      \
   V(kStackIsIterableOffset, kUInt8Size)                                       \
   /* This padding aligns IsolateData size by 8 bytes. */                      \
   V(kPaddingOffset,                                                           \
     8 + RoundUp<8>(static_cast<int>(kPaddingOffset)) - kPaddingOffset)        \
   /* Total size. */                                                           \
   V(kSize, 0)
+
+#ifdef V8_HEAP_SANDBOX
+#define FIELDS_HEAP_SANDBOX(V) \
+  V(kExternalPointerTableOffset, kSystemPointerSize * 3)
+#else
+#define FIELDS_HEAP_SANDBOX(V)
+#endif  // V8_HEAP_SANDBOX
 
   DEFINE_FIELD_OFFSET_CONSTANTS(0, FIELDS)
 #undef FIELDS
@@ -150,26 +169,16 @@ class IsolateData final {
   // runtime checks.
   void* embedder_data_[Internals::kNumIsolateDataSlots] = {};
 
-  // TODO(ishell): Move these external memory counters back to Heap once the
-  // Node JS bot issue is solved.
-  // The amount of external memory registered through the API.
-  int64_t external_memory_ = 0;
-
-  // The limit when to trigger memory pressure from the API.
-  int64_t external_memory_limit_ = kExternalAllocationSoftLimit;
-
-  // Caches the amount of external memory registered at the last MC.
-  int64_t external_memory_low_since_mark_compact_ = 0;
-
   // Stores the state of the caller for TurboAssembler::CallCFunction so that
   // the sampling CPU profiler can iterate the stack during such calls. These
   // are stored on IsolateData so that they can be stored to with only one move
   // instruction in compiled code.
   Address fast_c_call_caller_fp_ = kNullAddress;
   Address fast_c_call_caller_pc_ = kNullAddress;
+  Address fast_api_call_target_ = kNullAddress;
 
-  // Fields related to the system and JS stack. In particular, this contains the
-  // stack limit used by stack checks in generated code.
+  // Fields related to the system and JS stack. In particular, this contains
+  // the stack limit used by stack checks in generated code.
   StackGuard stack_guard_;
 
   RootsTable roots_;
@@ -185,6 +194,11 @@ class IsolateData final {
 
   // The entries in this array are tagged pointers to Code objects.
   Address builtins_[Builtins::builtin_count] = {};
+
+  // Table containing pointers to external objects.
+#ifdef V8_HEAP_SANDBOX
+  ExternalPointerTable external_pointer_table_;
+#endif
 
   // Whether the SafeStackFrameIterator can successfully iterate the current
   // stack. Only valid values are 0 or 1.
@@ -224,18 +238,17 @@ void IsolateData::AssertPredictableLayout() {
   STATIC_ASSERT(offsetof(IsolateData, thread_local_top_) ==
                 kThreadLocalTopOffset);
   STATIC_ASSERT(offsetof(IsolateData, builtins_) == kBuiltinsTableOffset);
-  STATIC_ASSERT(offsetof(IsolateData, external_memory_) ==
-                kExternalMemoryOffset);
-  STATIC_ASSERT(offsetof(IsolateData, external_memory_limit_) ==
-                kExternalMemoryLlimitOffset);
-  STATIC_ASSERT(
-      offsetof(IsolateData, external_memory_low_since_mark_compact_) ==
-      kExternalMemoryLowSinceMarkCompactOffset);
   STATIC_ASSERT(offsetof(IsolateData, fast_c_call_caller_fp_) ==
                 kFastCCallCallerFPOffset);
   STATIC_ASSERT(offsetof(IsolateData, fast_c_call_caller_pc_) ==
                 kFastCCallCallerPCOffset);
+  STATIC_ASSERT(offsetof(IsolateData, fast_api_call_target_) ==
+                kFastApiCallTargetOffset);
   STATIC_ASSERT(offsetof(IsolateData, stack_guard_) == kStackGuardOffset);
+#ifdef V8_HEAP_SANDBOX
+  STATIC_ASSERT(offsetof(IsolateData, external_pointer_table_) ==
+                kExternalPointerTableOffset);
+#endif
   STATIC_ASSERT(offsetof(IsolateData, stack_is_iterable_) ==
                 kStackIsIterableOffset);
   STATIC_ASSERT(sizeof(IsolateData) == IsolateData::kSize);

@@ -42,7 +42,7 @@ struct OptionData {
 Maybe<bool> InsertOptionsIntoLocale(Isolate* isolate,
                                     Handle<JSReceiver> options,
                                     icu::LocaleBuilder* builder) {
-  CHECK(isolate);
+  DCHECK(isolate);
 
   const std::vector<const char*> hour_cycle_values = {"h11", "h12", "h23",
                                                       "h24"};
@@ -103,6 +103,9 @@ Handle<Object> UnicodeKeywordValue(Isolate* isolate, Handle<JSLocale> locale,
   }
   if (value == "yes") {
     value = "true";
+  }
+  if (value == "true" && strcmp(key, "kf") == 0) {
+    return isolate->factory()->NewStringFromStaticChars("");
   }
   return isolate->factory()->NewStringFromAsciiChecked(value.c_str());
 }
@@ -234,18 +237,20 @@ Maybe<bool> ApplyOptionsToTag(Isolate* isolate, Handle<String> tag,
 
   v8::String::Utf8Value bcp47_tag(v8_isolate, v8::Utils::ToLocal(tag));
   builder->setLanguageTag({*bcp47_tag, bcp47_tag.length()});
-  CHECK_LT(0, bcp47_tag.length());
-  CHECK_NOT_NULL(*bcp47_tag);
+  DCHECK_LT(0, bcp47_tag.length());
+  DCHECK_NOT_NULL(*bcp47_tag);
   // 2. If IsStructurallyValidLanguageTag(tag) is false, throw a RangeError
   // exception.
   if (!JSLocale::StartsWithUnicodeLanguageId(*bcp47_tag)) {
     return Just(false);
   }
   UErrorCode status = U_ZERO_ERROR;
-  builder->build(status);
+  icu::Locale canonicalized = builder->build(status);
+  canonicalized.canonicalize(status);
   if (U_FAILURE(status)) {
     return Just(false);
   }
+  builder->setLocale(canonicalized);
 
   // 3. Let language be ? GetOption(options, "language", "string", undefined,
   // undefined).
@@ -346,6 +351,9 @@ MaybeHandle<JSLocale> JSLocale::New(Isolate* isolate, Handle<Map> map,
   MAYBE_RETURN(maybe_insert, MaybeHandle<JSLocale>());
   UErrorCode status = U_ZERO_ERROR;
   icu::Locale icu_locale = builder.build(status);
+
+  icu_locale.canonicalize(status);
+
   if (!maybe_insert.FromJust() || U_FAILURE(status)) {
     THROW_NEW_ERROR(isolate,
                     NewRangeError(MessageTemplate::kLocaleBadParameters),
@@ -359,7 +367,7 @@ MaybeHandle<JSLocale> JSLocale::New(Isolate* isolate, Handle<Map> map,
   // Now all properties are ready, so we can allocate the result object.
   Handle<JSLocale> locale = Handle<JSLocale>::cast(
       isolate->factory()->NewFastOrSlowJSObjectFromMap(map));
-  DisallowHeapAllocation no_gc;
+  DisallowGarbageCollection no_gc;
   locale->set_icu_locale(*managed_locale);
   return locale;
 }
@@ -381,7 +389,7 @@ MaybeHandle<JSLocale> Construct(Isolate* isolate,
 
   Handle<JSLocale> locale = Handle<JSLocale>::cast(
       isolate->factory()->NewFastOrSlowJSObjectFromMap(map));
-  DisallowHeapAllocation no_gc;
+  DisallowGarbageCollection no_gc;
   locale->set_icu_locale(*managed_locale);
   return locale;
 }

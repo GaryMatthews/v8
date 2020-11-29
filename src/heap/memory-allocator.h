@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "include/v8-platform.h"
 #include "src/base/bounded-page-allocator.h"
 #include "src/base/export-template.h"
 #include "src/base/macros.h"
@@ -27,6 +28,7 @@ namespace internal {
 
 class Heap;
 class Isolate;
+class ReadOnlyPage;
 
 // The process-wide singleton that keeps track of code range regions with the
 // intention to reuse free code range regions as a workaround for CFG memory
@@ -59,14 +61,10 @@ class MemoryAllocator {
   // chunks.
   class Unmapper {
    public:
-    class UnmapFreeMemoryTask;
+    class UnmapFreeMemoryJob;
 
     Unmapper(Heap* heap, MemoryAllocator* allocator)
-        : heap_(heap),
-          allocator_(allocator),
-          pending_unmapping_tasks_semaphore_(0),
-          pending_unmapping_tasks_(0),
-          active_unmapping_tasks_(0) {
+        : heap_(heap), allocator_(allocator) {
       chunks_[kRegular].reserve(kReservedQueueingSlots);
       chunks_[kPooled].reserve(kReservedQueueingSlots);
     }
@@ -140,18 +138,16 @@ class MemoryAllocator {
     bool MakeRoomForNewTasks();
 
     template <FreeMode mode>
-    void PerformFreeMemoryOnQueuedChunks();
+    void PerformFreeMemoryOnQueuedChunks(JobDelegate* delegate = nullptr);
 
-    void PerformFreeMemoryOnQueuedNonRegularChunks();
+    void PerformFreeMemoryOnQueuedNonRegularChunks(
+        JobDelegate* delegate = nullptr);
 
     Heap* const heap_;
     MemoryAllocator* const allocator_;
     base::Mutex mutex_;
     std::vector<MemoryChunk*> chunks_[kNumberOfChunkQueues];
-    CancelableTaskManager::Id task_ids_[kMaxUnmapperTasks];
-    base::Semaphore pending_unmapping_tasks_semaphore_;
-    intptr_t pending_unmapping_tasks_;
-    std::atomic<intptr_t> active_unmapping_tasks_;
+    std::unique_ptr<v8::JobHandle> job_handle_;
 
     friend class MemoryAllocator;
   };
@@ -192,9 +188,15 @@ class MemoryAllocator {
   LargePage* AllocateLargePage(size_t size, LargeObjectSpace* owner,
                                Executability executable);
 
+  ReadOnlyPage* AllocateReadOnlyPage(size_t size, ReadOnlySpace* owner);
+
+  std::unique_ptr<::v8::PageAllocator::SharedMemoryMapping> RemapSharedPage(
+      ::v8::PageAllocator::SharedMemory* shared_memory, Address new_address);
+
   template <MemoryAllocator::FreeMode mode = kFull>
   EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE)
   void Free(MemoryChunk* chunk);
+  void FreeReadOnlyPage(ReadOnlyPage* chunk);
 
   // Returns allocated spaces in bytes.
   size_t Size() const { return size_; }
@@ -215,13 +217,20 @@ class MemoryAllocator {
            address >= highest_ever_allocated_;
   }
 
+  // Returns a BasicMemoryChunk in which the memory region from commit_area_size
+  // to reserve_area_size of the chunk area is reserved but not committed, it
+  // could be committed later by calling MemoryChunk::CommitArea.
+  V8_EXPORT_PRIVATE BasicMemoryChunk* AllocateBasicChunk(
+      size_t reserve_area_size, size_t commit_area_size,
+      Executability executable, BaseSpace* space);
+
   // Returns a MemoryChunk in which the memory region from commit_area_size to
   // reserve_area_size of the chunk area is reserved but not committed, it
   // could be committed later by calling MemoryChunk::CommitArea.
   V8_EXPORT_PRIVATE MemoryChunk* AllocateChunk(size_t reserve_area_size,
                                                size_t commit_area_size,
                                                Executability executable,
-                                               Space* space);
+                                               BaseSpace* space);
 
   Address AllocateAlignedMemory(size_t reserve_size, size_t commit_size,
                                 size_t alignment, Executability executable,
@@ -233,7 +242,7 @@ class MemoryAllocator {
   // internally memory is freed from |start_free| to the end of the reservation.
   // Additional memory beyond the page is not accounted though, so
   // |bytes_to_free| is computed by the caller.
-  void PartialFreeMemory(MemoryChunk* chunk, Address start_free,
+  void PartialFreeMemory(BasicMemoryChunk* chunk, Address start_free,
                          size_t bytes_to_free, Address new_area_end);
 
   // Checks if an allocated MemoryChunk was intended to be used for executable
@@ -290,21 +299,27 @@ class MemoryAllocator {
   // Performs all necessary bookkeeping to free the memory, but does not free
   // it.
   void UnregisterMemory(MemoryChunk* chunk);
+  void UnregisterMemory(BasicMemoryChunk* chunk,
+                        Executability executable = NOT_EXECUTABLE);
+  void UnregisterSharedMemory(BasicMemoryChunk* chunk);
+
+  void RegisterReadOnlyMemory(ReadOnlyPage* page);
 
  private:
   void InitializeCodePageAllocator(v8::PageAllocator* page_allocator,
                                    size_t requested);
 
-  // PreFreeMemory logically frees the object, i.e., it unregisters the memory,
-  // logs a delete event and adds the chunk to remembered unmapped pages.
+  // PreFreeMemory logically frees the object, i.e., it unregisters the
+  // memory, logs a delete event and adds the chunk to remembered unmapped
+  // pages.
   void PreFreeMemory(MemoryChunk* chunk);
 
   // PerformFreeMemory can be called concurrently when PreFree was executed
   // before.
   void PerformFreeMemory(MemoryChunk* chunk);
 
-  // See AllocatePage for public interface. Note that currently we only support
-  // pools for NOT_EXECUTABLE pages of size MemoryChunk::kPageSize.
+  // See AllocatePage for public interface. Note that currently we only
+  // support pools for NOT_EXECUTABLE pages of size MemoryChunk::kPageSize.
   template <typename SpaceType>
   MemoryChunk* AllocatePagePooled(SpaceType* owner);
 
@@ -350,15 +365,16 @@ class MemoryAllocator {
   VirtualMemory code_reservation_;
 
   // Page allocator used for allocating data pages. Depending on the
-  // configuration it may be a page allocator instance provided by v8::Platform
-  // or a BoundedPageAllocator (when pointer compression is enabled).
+  // configuration it may be a page allocator instance provided by
+  // v8::Platform or a BoundedPageAllocator (when pointer compression is
+  // enabled).
   v8::PageAllocator* data_page_allocator_;
 
   // Page allocator used for allocating code pages. Depending on the
-  // configuration it may be a page allocator instance provided by v8::Platform
-  // or a BoundedPageAllocator (when pointer compression is enabled or
-  // on those 64-bit architectures where pc-relative 32-bit displacement
-  // can be used for call and jump instructions).
+  // configuration it may be a page allocator instance provided by
+  // v8::Platform or a BoundedPageAllocator (when pointer compression is
+  // enabled or on those 64-bit architectures where pc-relative 32-bit
+  // displacement can be used for call and jump instructions).
   v8::PageAllocator* code_page_allocator_;
 
   // A part of the |code_reservation_| that may contain executable code
@@ -371,10 +387,11 @@ class MemoryAllocator {
   // optionally existing page in the beginning of the |code_range_|.
   // So, summarizing all above, the following conditions hold:
   // 1) |code_reservation_| >= |code_range_|
-  // 2) |code_range_| >= |optional RW pages| + |code_page_allocator_instance_|.
-  // 3) |code_reservation_| is AllocatePageSize()-aligned
-  // 4) |code_page_allocator_instance_| is MemoryChunk::kAlignment-aligned
-  // 5) |code_range_| is CommitPageSize()-aligned
+  // 2) |code_range_| >= |optional RW pages| +
+  // |code_page_allocator_instance_|. 3) |code_reservation_| is
+  // AllocatePageSize()-aligned 4) |code_page_allocator_instance_| is
+  // MemoryChunk::kAlignment-aligned 5) |code_range_| is
+  // CommitPageSize()-aligned
   std::unique_ptr<base::BoundedPageAllocator> code_page_allocator_instance_;
 
   // Maximum space size in bytes.
@@ -401,6 +418,7 @@ class MemoryAllocator {
   base::Mutex executable_memory_mutex_;
 
   friend class heap::TestCodePageAllocatorScope;
+  friend class heap::TestMemoryAllocatorScope;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(MemoryAllocator);
 };

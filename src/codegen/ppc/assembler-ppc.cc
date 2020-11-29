@@ -248,6 +248,15 @@ Assembler::Assembler(const AssemblerOptions& options,
 void Assembler::GetCode(Isolate* isolate, CodeDesc* desc,
                         SafepointTableBuilder* safepoint_table_builder,
                         int handler_table_offset) {
+  // As a crutch to avoid having to add manual Align calls wherever we use a
+  // raw workflow to create Code objects (mostly in tests), add another Align
+  // call here. It does no harm - the end of the Code object is aligned to the
+  // (larger) kCodeAlignment anyways.
+  // TODO(jgruber): Consider moving responsibility for proper alignment to
+  // metadata table builders (safepoint, handler, constant pool, code
+  // comments).
+  DataAlign(Code::kMetadataAlignment);
+
   // Emit constant pool if necessary.
   int constant_pool_size = EmitConstantPool();
 
@@ -1457,6 +1466,9 @@ void Assembler::mcrfs(CRegister cr, FPSCRBit bit) {
 
 void Assembler::mfcr(Register dst) { emit(EXT2 | MFCR | dst.code() * B21); }
 
+void Assembler::mtcrf(unsigned char FXM, Register src) {
+  emit(MTCRF | src.code() * B21 | FXM * B12);
+}
 #if V8_TARGET_ARCH_PPC64
 void Assembler::mffprd(Register dst, DoubleRegister src) {
   emit(EXT2 | MFVSRD | src.code() * B21 | dst.code() * B16);
@@ -1631,6 +1643,10 @@ void Assembler::fctiw(const DoubleRegister frt, const DoubleRegister frb) {
   emit(EXT4 | FCTIW | frt.code() * B21 | frb.code() * B11);
 }
 
+void Assembler::fctiwuz(const DoubleRegister frt, const DoubleRegister frb) {
+  emit(EXT4 | FCTIWUZ | frt.code() * B21 | frb.code() * B11);
+}
+
 void Assembler::frin(const DoubleRegister frt, const DoubleRegister frb,
                      RCBit rc) {
   emit(EXT4 | FRIN | frt.code() * B21 | frb.code() * B11 | rc);
@@ -1758,50 +1774,42 @@ void Assembler::fmsub(const DoubleRegister frt, const DoubleRegister fra,
 }
 
 // Vector instructions
-void Assembler::mfvsrd(const Register ra, const DoubleRegister rs) {
+void Assembler::mfvsrd(const Register ra, const Simd128Register rs) {
   int SX = 1;
   emit(MFVSRD | rs.code() * B21 | ra.code() * B16 | SX);
 }
 
-void Assembler::mfvsrwz(const Register ra, const DoubleRegister rs) {
+void Assembler::mfvsrwz(const Register ra, const Simd128Register rs) {
   int SX = 1;
   emit(MFVSRWZ | rs.code() * B21 | ra.code() * B16 | SX);
 }
 
-void Assembler::mtvsrd(const DoubleRegister rt, const Register ra) {
+void Assembler::mtvsrd(const Simd128Register rt, const Register ra) {
   int TX = 1;
   emit(MTVSRD | rt.code() * B21 | ra.code() * B16 | TX);
 }
 
-void Assembler::vor(const DoubleRegister rt, const DoubleRegister ra,
-                    const DoubleRegister rb) {
-  emit(VOR | rt.code() * B21 | ra.code() * B16 | rb.code() * B11);
+void Assembler::mtvsrdd(const Simd128Register rt, const Register ra,
+                        const Register rb) {
+  int TX = 1;
+  emit(MTVSRDD | rt.code() * B21 | ra.code() * B16 | rb.code() * B11 | TX);
 }
 
-void Assembler::vxor(const DoubleRegister rt, const DoubleRegister ra,
-                     const DoubleRegister rb) {
-  emit(VXOR | rt.code() * B21 | ra.code() * B16 | rb.code() * B11);
+void Assembler::lxvd(const Simd128Register rt, const MemOperand& src) {
+  int TX = 1;
+  emit(LXVD | rt.code() * B21 | src.ra().code() * B16 | src.rb().code() * B11 |
+       TX);
 }
 
-void Assembler::vnor(const DoubleRegister rt, const DoubleRegister ra,
-                     const DoubleRegister rb) {
-  emit(VNOR | rt.code() * B21 | ra.code() * B16 | rb.code() * B11);
+void Assembler::stxvd(const Simd128Register rt, const MemOperand& dst) {
+  int SX = 1;
+  emit(STXVD | rt.code() * B21 | dst.ra().code() * B16 | dst.rb().code() * B11 |
+       SX);
 }
 
-void Assembler::vsro(const DoubleRegister rt, const DoubleRegister ra,
-                     const DoubleRegister rb) {
-  emit(VSRO | rt.code() * B21 | ra.code() * B16 | rb.code() * B11);
-}
-
-void Assembler::vslo(const DoubleRegister rt, const DoubleRegister ra,
-                     const DoubleRegister rb) {
-  emit(VSLO | rt.code() * B21 | ra.code() * B16 | rb.code() * B11);
-}
-
-void Assembler::vperm(const DoubleRegister rt, const DoubleRegister ra,
-                      const DoubleRegister rb, const DoubleRegister rc) {
-  emit(VPERM | rt.code() * B21 | ra.code() * B16 | rb.code() * B11 |
-       rc.code() * B6);
+void Assembler::xxspltib(const Simd128Register rt, const Operand& imm) {
+  int TX = 1;
+  emit(XXSPLTIB | rt.code() * B21 | imm.immediate() * B11 | TX);
 }
 
 // Pseudo instructions.

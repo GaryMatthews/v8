@@ -134,7 +134,9 @@ class RegisteredExtension {
   V(Primitive, Object)                         \
   V(PrimitiveArray, FixedArray)                \
   V(BigInt, BigInt)                            \
-  V(ScriptOrModule, Script)
+  V(ScriptOrModule, Script)                    \
+  V(FixedArray, FixedArray)                    \
+  V(ModuleRequest, ModuleRequest)
 
 class Utils {
  public:
@@ -302,30 +304,7 @@ inline bool ToLocal(v8::internal::MaybeHandle<v8::internal::Object> maybe,
 
 namespace internal {
 
-class V8_EXPORT_PRIVATE DeferredHandles {
- public:
-  ~DeferredHandles();
-
- private:
-  DeferredHandles(Address* first_block_limit, Isolate* isolate)
-      : next_(nullptr),
-        previous_(nullptr),
-        first_block_limit_(first_block_limit),
-        isolate_(isolate) {
-    isolate->LinkDeferredHandles(this);
-  }
-
-  void Iterate(RootVisitor* v);
-
-  std::vector<Address*> blocks_;
-  DeferredHandles* next_;
-  DeferredHandles* previous_;
-  Address* first_block_limit_;
-  Isolate* isolate_;
-
-  friend class HandleScopeImplementer;
-  friend class Isolate;
-};
+class PersistentHandles;
 
 // This class is here in order to be able to declare it a friend of
 // HandleScope.  Moving these methods to be members of HandleScope would be
@@ -338,7 +317,7 @@ class V8_EXPORT_PRIVATE DeferredHandles {
 // data.
 class HandleScopeImplementer {
  public:
-  class EnteredContextRewindScope {
+  class V8_NODISCARD EnteredContextRewindScope {
    public:
     explicit EnteredContextRewindScope(HandleScopeImplementer* hsi)
         : hsi_(hsi), saved_entered_context_count_(hsi->EnteredContextCount()) {}
@@ -431,7 +410,7 @@ class HandleScopeImplementer {
   }
 
   void BeginDeferredScope();
-  std::unique_ptr<DeferredHandles> Detach(Address* prev_limit);
+  std::unique_ptr<PersistentHandles> DetachPersistent(Address* prev_limit);
 
   Isolate* isolate_;
   DetachableVector<Address*> blocks_;
@@ -455,9 +434,8 @@ class HandleScopeImplementer {
   char* RestoreThreadHelper(char* from);
   char* ArchiveThreadHelper(char* to);
 
-  friend class DeferredHandles;
-  friend class DeferredHandleScope;
   friend class HandleScopeImplementerOffsets;
+  friend class PersistentHandlesScope;
 
   DISALLOW_COPY_AND_ASSIGN(HandleScopeImplementer);
 };

@@ -427,6 +427,23 @@ class Assembler : public AssemblerBase {
 #undef DECLARE_PPC_X_INSTRUCTIONS_EH_S_FORM
 #undef DECLARE_PPC_X_INSTRUCTIONS_EH_L_FORM
 
+#define DECLARE_PPC_XX2_INSTRUCTIONS(name, instr_name, instr_value)      \
+  inline void name(const Simd128Register rt, const Simd128Register rb) { \
+    xx2_form(instr_name, rt, rb);                                        \
+  }
+
+  inline void xx2_form(Instr instr, Simd128Register t, Simd128Register b) {
+    // Using VR (high VSR) registers.
+    int BX = 1;
+    int TX = 1;
+
+    emit(instr | (t.code() & 0x1F) * B21 | (b.code() & 0x1F) * B11 | BX * B1 |
+         TX);
+  }
+
+  PPC_XX2_OPCODE_A_FORM_LIST(DECLARE_PPC_XX2_INSTRUCTIONS)
+#undef DECLARE_PPC_XX2_INSTRUCTIONS
+
 #define DECLARE_PPC_XX3_INSTRUCTIONS(name, instr_name, instr_value)  \
   inline void name(const DoubleRegister rt, const DoubleRegister ra, \
                    const DoubleRegister rb) {                        \
@@ -435,9 +452,10 @@ class Assembler : public AssemblerBase {
 
   inline void xx3_form(Instr instr, DoubleRegister t, DoubleRegister a,
                        DoubleRegister b) {
-    int AX = ((a.code() & 0x20) >> 5) & 0x1;
-    int BX = ((b.code() & 0x20) >> 5) & 0x1;
-    int TX = ((t.code() & 0x20) >> 5) & 0x1;
+    // Using VR (high VSR) registers.
+    int AX = 1;
+    int BX = 1;
+    int TX = 1;
 
     emit(instr | (t.code() & 0x1F) * B21 | (a.code() & 0x1F) * B16 |
          (b.code() & 0x1F) * B11 | AX * B2 | BX * B1 | TX);
@@ -447,18 +465,68 @@ class Assembler : public AssemblerBase {
 #undef DECLARE_PPC_XX3_INSTRUCTIONS
 
 #define DECLARE_PPC_VX_INSTRUCTIONS_A_FORM(name, instr_name, instr_value) \
-  inline void name(const DoubleRegister rt, const DoubleRegister rb,      \
+  inline void name(const Simd128Register rt, const Simd128Register rb,    \
                    const Operand& imm) {                                  \
     vx_form(instr_name, rt, rb, imm);                                     \
   }
+#define DECLARE_PPC_VX_INSTRUCTIONS_B_FORM(name, instr_name, instr_value) \
+  inline void name(const Simd128Register rt, const Simd128Register ra,    \
+                   const Simd128Register rb) {                            \
+    vx_form(instr_name, rt, ra, rb);                                      \
+  }
+#define DECLARE_PPC_VX_INSTRUCTIONS_C_FORM(name, instr_name, instr_value) \
+  inline void name(const Simd128Register rt, const Simd128Register rb) {  \
+    vx_form(instr_name, rt, rb);                                          \
+  }
 
-  inline void vx_form(Instr instr, DoubleRegister rt, DoubleRegister rb,
+  inline void vx_form(Instr instr, Simd128Register rt, Simd128Register rb,
                       const Operand& imm) {
     emit(instr | rt.code() * B21 | imm.immediate() * B16 | rb.code() * B11);
   }
+  inline void vx_form(Instr instr, Simd128Register rt, Simd128Register ra,
+                      Simd128Register rb) {
+    emit(instr | rt.code() * B21 | ra.code() * B16 | rb.code() * B11);
+  }
+  inline void vx_form(Instr instr, Simd128Register rt, Simd128Register rb) {
+    emit(instr | rt.code() * B21 | rb.code() * B11);
+  }
 
   PPC_VX_OPCODE_A_FORM_LIST(DECLARE_PPC_VX_INSTRUCTIONS_A_FORM)
+  PPC_VX_OPCODE_B_FORM_LIST(DECLARE_PPC_VX_INSTRUCTIONS_B_FORM)
+  PPC_VX_OPCODE_C_FORM_LIST(DECLARE_PPC_VX_INSTRUCTIONS_C_FORM)
 #undef DECLARE_PPC_VX_INSTRUCTIONS_A_FORM
+#undef DECLARE_PPC_VX_INSTRUCTIONS_B_FORM
+#undef DECLARE_PPC_VX_INSTRUCTIONS_C_FORM
+
+#define DECLARE_PPC_VA_INSTRUCTIONS_A_FORM(name, instr_name, instr_value) \
+  inline void name(const Simd128Register rt, const Simd128Register ra,    \
+                   const Simd128Register rb, const Simd128Register rc) {  \
+    va_form(instr_name, rt, ra, rb, rc);                                  \
+  }
+
+  inline void va_form(Instr instr, Simd128Register rt, Simd128Register ra,
+                      Simd128Register rb, Simd128Register rc) {
+    emit(instr | rt.code() * B21 | ra.code() * B16 | rb.code() * B11 |
+         rc.code() * B6);
+  }
+
+  PPC_VA_OPCODE_A_FORM_LIST(DECLARE_PPC_VA_INSTRUCTIONS_A_FORM)
+#undef DECLARE_PPC_VA_INSTRUCTIONS_A_FORM
+
+#define DECLARE_PPC_VC_INSTRUCTIONS(name, instr_name, instr_value)       \
+  inline void name(const Simd128Register rt, const Simd128Register ra,   \
+                   const Simd128Register rb, const RCBit rc = LeaveRC) { \
+    vc_form(instr_name, rt, ra, rb, rc);                                 \
+  }
+
+  inline void vc_form(Instr instr, Simd128Register rt, Simd128Register ra,
+                      Simd128Register rb, int rc) {
+    emit(instr | rt.code() * B21 | ra.code() * B16 | rb.code() * B11 |
+         rc * B10);
+  }
+
+  PPC_VC_OPCODE_LIST(DECLARE_PPC_VC_INSTRUCTIONS)
+#undef DECLARE_PPC_VC_INSTRUCTIONS
 
   RegList* GetScratchRegisterList() { return &scratch_register_list_; }
   // ---------------------------------------------------------------------------
@@ -854,6 +922,7 @@ class Assembler : public AssemblerBase {
   void mtxer(Register src);
   void mcrfs(CRegister cr, FPSCRBit bit);
   void mfcr(Register dst);
+  void mtcrf(unsigned char FXM, Register src);
 #if V8_TARGET_ARCH_PPC64
   void mffprd(Register dst, DoubleRegister src);
   void mffprwz(Register dst, DoubleRegister src);
@@ -898,6 +967,7 @@ class Assembler : public AssemblerBase {
            RCBit rc = LeaveRC);
   void fctiwz(const DoubleRegister frt, const DoubleRegister frb);
   void fctiw(const DoubleRegister frt, const DoubleRegister frb);
+  void fctiwuz(const DoubleRegister frt, const DoubleRegister frb);
   void frin(const DoubleRegister frt, const DoubleRegister frb,
             RCBit rc = LeaveRC);
   void friz(const DoubleRegister frt, const DoubleRegister frb,
@@ -947,21 +1017,13 @@ class Assembler : public AssemblerBase {
              RCBit rc = LeaveRC);
 
   // Vector instructions
-  void mfvsrd(const Register ra, const DoubleRegister r);
-  void mfvsrwz(const Register ra, const DoubleRegister r);
-  void mtvsrd(const DoubleRegister rt, const Register ra);
-  void vxor(const DoubleRegister rt, const DoubleRegister ra,
-            const DoubleRegister rb);
-  void vnor(const DoubleRegister rt, const DoubleRegister ra,
-            const DoubleRegister rb);
-  void vor(const DoubleRegister rt, const DoubleRegister ra,
-           const DoubleRegister rb);
-  void vsro(const DoubleRegister rt, const DoubleRegister ra,
-            const DoubleRegister rb);
-  void vslo(const DoubleRegister rt, const DoubleRegister ra,
-            const DoubleRegister rb);
-  void vperm(const DoubleRegister rt, const DoubleRegister ra,
-             const DoubleRegister rb, const DoubleRegister rc);
+  void mfvsrd(const Register ra, const Simd128Register r);
+  void mfvsrwz(const Register ra, const Simd128Register r);
+  void mtvsrd(const Simd128Register rt, const Register ra);
+  void mtvsrdd(const Simd128Register rt, const Register ra, const Register rb);
+  void lxvd(const Simd128Register rt, const MemOperand& src);
+  void stxvd(const Simd128Register rt, const MemOperand& src);
+  void xxspltib(const Simd128Register rt, const Operand& imm);
 
   // Pseudo instructions
 
@@ -1015,7 +1077,7 @@ class Assembler : public AssemblerBase {
   }
 
   // Class for scoping postponing the trampoline pool generation.
-  class BlockTrampolinePoolScope {
+  class V8_NODISCARD BlockTrampolinePoolScope {
    public:
     explicit BlockTrampolinePoolScope(Assembler* assem) : assem_(assem) {
       assem_->StartBlockTrampolinePool();
@@ -1029,7 +1091,7 @@ class Assembler : public AssemblerBase {
   };
 
   // Class for scoping disabling constant pool entry merging
-  class BlockConstantPoolEntrySharingScope {
+  class V8_NODISCARD BlockConstantPoolEntrySharingScope {
    public:
     explicit BlockConstantPoolEntrySharingScope(Assembler* assem)
         : assem_(assem) {
@@ -1355,7 +1417,7 @@ class PatchingAssembler : public Assembler {
   ~PatchingAssembler();
 };
 
-class V8_EXPORT_PRIVATE UseScratchRegisterScope {
+class V8_EXPORT_PRIVATE V8_NODISCARD UseScratchRegisterScope {
  public:
   explicit UseScratchRegisterScope(Assembler* assembler);
   ~UseScratchRegisterScope();
